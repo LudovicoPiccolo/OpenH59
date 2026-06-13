@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1280px; height: 640px; overflow: hidden; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    background: #0a0e14;
+    background-image:
+      radial-gradient(900px 500px at 78% 18%, rgba(0,130,252,0.18), transparent 60%),
+      radial-gradient(700px 500px at 12% 95%, rgba(255,60,90,0.12), transparent 60%);
+    color: #e6edf3;
+    position: relative;
+  }
+  /* subtle grid */
+  .grid {
+    position: absolute; inset: 0;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.035) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.035) 1px, transparent 1px);
+    background-size: 40px 40px;
+    mask-image: radial-gradient(circle at 50% 40%, #000 40%, transparent 85%);
+  }
+  .wrap { position: relative; height: 100%; padding: 70px 80px; display: flex; flex-direction: column; }
+  .top { display: flex; align-items: center; gap: 14px; }
+  .dot { width: 13px; height: 13px; border-radius: 50%; background: #0082fc; box-shadow: 0 0 16px #0082fc; }
+  .top .label { font-size: 22px; letter-spacing: 4px; text-transform: uppercase; color: #7d8aa0; font-weight: 600; }
+  .title { margin-top: 36px; font-size: 118px; font-weight: 800; line-height: 1; letter-spacing: -3px; }
+  .title .open { color: #6ea8ff; }
+  .title .h { color: #ffffff; }
+  .sub { margin-top: 26px; font-size: 37px; font-weight: 500; color: #b9c4d4; line-height: 1.25; max-width: 820px; }
+  .sub b { color: #ffffff; font-weight: 700; }
+  .badges { margin-top: auto; display: flex; gap: 14px; flex-wrap: wrap; }
+  .badge {
+    font-family: Menlo, Monaco, monospace;
+    font-size: 22px; padding: 12px 20px; border-radius: 10px;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
+    color: #cdd6e2;
+  }
+  .badge.accent { border-color: rgba(0,130,252,0.5); color: #9cc4ff; background: rgba(0,130,252,0.08); }
+  .heart { position: absolute; right: 90px; top: 96px; font-size: 215px; color: rgba(255,60,90,0.9);
+           filter: drop-shadow(0 0 40px rgba(255,60,90,0.45)); }
+  .pulse { position: absolute; right: 80px; top: 318px; font-family: Menlo, monospace; font-size: 26px; color: #ff6b85; opacity: .92; text-align: right; }
+</style>
+</head>
+<body>
+  <div class="grid"></div>
+  <div class="heart">♥</div>
+  <div class="pulse">75 bpm · SpO₂ 98%</div>
+  <div class="wrap">
+    <div class="top">
+      <div class="dot"></div>
+      <div class="label">Bluetooth&nbsp;LE · Reverse&nbsp;Engineering</div>
+    </div>
+    <div class="title"><span class="open">Open</span><span class="h">H59</span></div>
+    <div class="sub">Your <b>H59</b> fitness band without the app — bypass <b>QWatch&nbsp;Pro</b>, keep your health data <b>self-hosted</b>. No cloud.</div>
+    <div class="badges">
+      <div class="badge accent">Python · bleak</div>
+      <div class="badge">MySQL / MariaDB</div>
+      <div class="badge">PHP dashboard</div>
+      <div class="badge">macOS</div>
+      <div class="badge">Colmi protocol</div>
+    </div>
+  </div>
+</body>
+</html>

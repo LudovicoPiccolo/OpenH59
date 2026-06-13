@@ -1,0 +1,21 @@
+# --- Dati personali / sensibili (NON pubblicare) ---
+# Log con misure di salute reali (pressione, battito, stress)
+sync.log
+# Cattura grezza del traffico Bluetooth: MAC, seriali, dati salute
+docs/btsnoop_hci.log
+*.btsnoop
+btsnoop_hci.log
+
+# --- Ambiente Python (rigenerabile, contiene path della macchina) ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# --- File di sistema macOS ---
+.DS_Store
+
+# --- Config locale con credenziali / indirizzo device ---
+.env
+!.env.example
