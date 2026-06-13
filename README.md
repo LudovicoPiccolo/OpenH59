@@ -176,16 +176,5 @@ While the Mac keeps the dashboard running, open `http://<Mac-IP>:8080` from your
 
 H59 smart band · H59 fitness tracker · H59 smartwatch · QWatch Pro alternative · QCWatch · Colmi protocol · reverse engineering · Bluetooth Low Energy (BLE) · `bleak` · CoreBluetooth · heart rate · SpO2 · blood pressure · stress · HRV · steps · self-hosted health data · no cloud · privacy · MySQL · MariaDB · PHP dashboard · Python · macOS · open source fitness band.
 
-### Suggested GitHub topics
-Paste these in **About → Topics** on the repo page (lowercase, hyphenated):
-
-```
-h59  qwatch-pro  qcwatch  colmi  fitness-tracker  smartwatch  fitness-band
-bluetooth-le  ble  bleak  reverse-engineering  heart-rate  spo2  hrv
-self-hosted  health-data  privacy  mysql  php  python  macos
-```
-
-> 💡 **Tip per la cercabilità:** imposta come *description* della repo su GitHub qualcosa tipo
-> *"Reverse-engineer your H59 fitness band (QWatch Pro / Colmi) over BLE — self-hosted health data in MySQL + PHP dashboard, no cloud."* — la description e i topics pesano più del README nella ricerca di GitHub.
 </content>
 </invoke>
