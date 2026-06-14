@@ -9,8 +9,9 @@
 ![PHP](https://img.shields.io/badge/PHP-8%2B-777bb4)
 ![Database](https://img.shields.io/badge/database-MySQL%20%2F%20MariaDB-00758f)
 ![BLE](https://img.shields.io/badge/protocol-Bluetooth%20LE-0082fc)
+![AI](https://img.shields.io/badge/AI-OpenRouter-ff4b4b)
 
-Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione, passi, stress, HRV) **bypassando l'app QWatch Pro**: parla direttamente con il device via **Bluetooth LE** (`bleak` / CoreBluetooth), salva tutto in un database **MySQL/MariaDB** locale e mostra i grafici in una **dashboard PHP** self-hosted.
+Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione, passi, stress, HRV) **bypassando l'app QWatch Pro**: parla direttamente con il device via **Bluetooth LE** (`bleak` / CoreBluetooth), salva tutto in un database **MySQL/MariaDB** locale e mostra i grafici in una **dashboard PHP** self-hosted — con **analisi AI opzionale** dei tuoi trend sanitari via OpenRouter.
 
 > 🇬🇧 **English version below** — [jump to English](#openh59--english).
 
@@ -19,15 +20,16 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 ## Componenti
 - `config.py` — legge la configurazione da `.env` (indirizzo braccialetto + DB).
 - `band.py` — client BLE del braccialetto (misure real-time + download storico).
-- `store.py` — database MySQL (tabelle: `measurements`, `hr_samples`, `step_samples`, `stress_samples`, `hrv_samples`).
+- `store.py` — database MySQL (tabelle: `measurements`, `hr_samples`, `step_samples`, `stress_samples`, `hrv_samples`, `ai_report`).
 - `collect.py` — collettore: scarica storico + misure on-demand → MySQL. Stampa un JSON di riepilogo.
 - `setup.py` — setup una-tantum (ora + log battito 24/7).
-- `index.php` — dashboard con grafici e bottoni di sincronizzazione.
+- `index.php` — dashboard con grafici, bottoni di sincronizzazione e **analisi AI** dei trend (OpenRouter).
 - `start.command` — avvia la dashboard.
 
 ## Cosa si ottiene
 - **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min), **SpO2 (oraria, min-max)** e **sonno a fasi** (leggero/profondo/REM/sveglio).
 - **On-demand** (misura del momento): battito, SpO2, pressione (sis/dia), stress.
+- **Analisi AI** (opzionale): invii il riepilogo dell'ultimo anno (365 giorni) a un modello via **OpenRouter** e ottieni un report sanitario sui tuoi trend. Funziona in due livelli — un riepilogo veloce e un'analisi completa — salvati nella tabella `ai_report`.
 
 ## Requisiti
 - **macOS** (il client BLE usa CoreBluetooth tramite `bleak`).
@@ -53,7 +55,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
    ```bash
    cp .env.example .env
    ```
-   Apri `.env` e compila `BAND_ADDRESS` e le credenziali del DB (i default vanno bene per MySQL locale senza password).
+   Apri `.env` e compila `BAND_ADDRESS` e le credenziali del DB (i default vanno bene per MySQL locale senza password). Per l'**analisi AI** (opzionale) aggiungi `OPENROUTER_API_KEY` (chiave da [openrouter.ai/keys](https://openrouter.ai/keys)) ed eventualmente `OPENROUTER_MODEL`.
 4. **Trova l'indirizzo del braccialetto** (`BAND_ADDRESS`). Indossa il braccialetto, spegni il Bluetooth del telefono, poi:
    ```bash
    .venv/bin/python -c "import asyncio; from bleak import BleakScanner; print('\n'.join(f'{d.address}  {d.name}' for d in asyncio.run(BleakScanner.discover())))"
@@ -75,6 +77,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 1. **Indossa il braccialetto** e **spegni il Bluetooth del telefono** (il braccialetto parla con un solo dispositivo per volta).
 2. Avvia la dashboard (`bash start.command`) e apri http://127.0.0.1:8080.
 3. Premi **Misura veloce** (~1 min) / **Misura completa** (~3 min, con pressione e stress) / **Solo storico** (~10 s).
+4. (Opzionale) Premi **Analisi AI** per inviare il riepilogo dell'ultimo anno a OpenRouter e ricevere il report sui tuoi trend.
 
 ### Dal cellulare
 Mentre il Mac tiene aperta la dashboard, dal telefono (stessa rete Wi-Fi) apri
@@ -88,6 +91,7 @@ Mentre il Mac tiene aperta la dashboard, dal telefono (stessa rete Wi-Fi) apri
 - Timestamp salvati in UTC.
 - SpO2 e sonno hanno storico sul dispositivo (canale BLE "ricco" `bc`, vedi `band.py`): li scarichiamo come gli altri.
 - La **pressione** non ha uno storico reale sul dispositivo: la curva "oraria" mostrata dall'app ufficiale è generata lato app (valori quasi costanti). Da noi resta solo misura on-demand.
+- L'**analisi AI** è opzionale e *opt-in*: è l'unica funzione che invia dati fuori dalla tua macchina (un riepilogo aggregato, non i campioni grezzi) e solo quando premi il bottone. Senza `OPENROUTER_API_KEY` tutto resta 100% locale.
 
 ---
 
@@ -95,22 +99,23 @@ Mentre il Mac tiene aperta la dashboard, dal telefono (stessa rete Wi-Fi) apri
 
 > **Reverse engineering the H59 fitness tracker (Colmi / QWatch Pro protocol) over Bluetooth LE.** No cloud, no account: your health data stays on your own machine.
 
-Collect and visualize data from the **H59** fitness band — heart rate, SpO2, blood pressure, steps, stress, HRV — **bypassing the QWatch Pro app**. It talks to the device directly over **Bluetooth LE** (`bleak` / CoreBluetooth), stores everything in a local **MySQL/MariaDB** database, and shows the charts in a self-hosted **PHP dashboard**.
+Collect and visualize data from the **H59** fitness band — heart rate, SpO2, blood pressure, steps, stress, HRV — **bypassing the QWatch Pro app**. It talks to the device directly over **Bluetooth LE** (`bleak` / CoreBluetooth), stores everything in a local **MySQL/MariaDB** database, and shows the charts in a self-hosted **PHP dashboard** — with **optional AI analysis** of your health trends via OpenRouter.
 
 **What it does:** a cheap smartwatch / fitness band (Colmi clones, QWatch Pro / QCWatch app) → raw data under your control, with nothing sent to third-party servers.
 
 ## Components
 - `config.py` — reads configuration from `.env` (band address + DB).
 - `band.py` — band BLE client (real-time measurements + history download).
-- `store.py` — MySQL database (tables: `measurements`, `hr_samples`, `step_samples`, `stress_samples`, `hrv_samples`).
+- `store.py` — MySQL database (tables: `measurements`, `hr_samples`, `step_samples`, `stress_samples`, `hrv_samples`, `ai_report`).
 - `collect.py` — collector: downloads history + on-demand measurements → MySQL. Prints a JSON summary.
 - `setup.py` — one-time setup (clock + 24/7 heart-rate logging).
-- `index.php` — dashboard with charts and sync buttons.
+- `index.php` — dashboard with charts, sync buttons and **AI trend analysis** (OpenRouter).
 - `start.command` — starts the dashboard.
 
 ## What you get
 - **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min), **SpO2 (hourly, min-max)** and **staged sleep** (light/deep/REM/awake).
 - **On-demand** (instant measurement): heart rate, SpO2, blood pressure (sys/dia), stress.
+- **AI analysis** (optional): send the last year's summary (365 days) to a model via **OpenRouter** and get a health report on your trends. It runs in two tiers — a quick summary and a full analysis — both saved in the `ai_report` table.
 
 ## Requirements
 - **macOS** (the BLE client uses CoreBluetooth via `bleak`).
@@ -136,7 +141,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
    ```bash
    cp .env.example .env
    ```
-   Open `.env` and fill in `BAND_ADDRESS` and the DB credentials (defaults are fine for a local passwordless MySQL).
+   Open `.env` and fill in `BAND_ADDRESS` and the DB credentials (defaults are fine for a local passwordless MySQL). For the (optional) **AI analysis** add `OPENROUTER_API_KEY` (key from [openrouter.ai/keys](https://openrouter.ai/keys)) and optionally `OPENROUTER_MODEL`.
 4. **Find the band address** (`BAND_ADDRESS`). Wear the band, turn off your phone's Bluetooth, then:
    ```bash
    .venv/bin/python -c "import asyncio; from bleak import BleakScanner; print('\n'.join(f'{d.address}  {d.name}' for d in asyncio.run(BleakScanner.discover())))"
@@ -158,6 +163,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 1. **Wear the band** and **turn off your phone's Bluetooth** (the band talks to one device at a time).
 2. Start the dashboard (`bash start.command`) and open http://127.0.0.1:8080.
 3. Press **Quick measure** (~1 min) / **Full measure** (~3 min, with blood pressure and stress) / **History only** (~10 s).
+4. (Optional) Press **AI analysis** to send the last year's summary to OpenRouter and get a report on your trends.
 
 ### From your phone
 While the Mac keeps the dashboard running, open `http://<Mac-IP>:8080` from your phone
@@ -171,12 +177,13 @@ While the Mac keeps the dashboard running, open `http://<Mac-IP>:8080` from your
 - Timestamps are stored in UTC.
 - SpO2 and sleep have on-device history (the "rich" BLE `bc` channel, see `band.py`): we download them like the rest.
 - **Blood pressure** has no real on-device history: the "hourly" curve shown by the official app is generated app-side (near-constant values). On our side it stays on-demand only.
+- **AI analysis** is optional and *opt-in*: it's the only feature that sends data off your machine (an aggregated summary, not the raw samples) and only when you press the button. Without `OPENROUTER_API_KEY` everything stays 100% local.
 
 ---
 
 ## Keywords
 
-H59 smart band · H59 fitness tracker · H59 smartwatch · QWatch Pro alternative · QCWatch · Colmi protocol · reverse engineering · Bluetooth Low Energy (BLE) · `bleak` · CoreBluetooth · heart rate · SpO2 · blood pressure · stress · HRV · steps · self-hosted health data · no cloud · privacy · MySQL · MariaDB · PHP dashboard · Python · macOS · open source fitness band.
+H59 smart band · H59 fitness tracker · H59 smartwatch · QWatch Pro alternative · QCWatch · Colmi protocol · reverse engineering · Bluetooth Low Energy (BLE) · `bleak` · CoreBluetooth · heart rate · SpO2 · blood pressure · stress · HRV · steps · staged sleep · AI health analysis · OpenRouter · LLM · self-hosted health data · no cloud · privacy · MySQL · MariaDB · PHP dashboard · Python · macOS · open source fitness band.
 
 </content>
 </invoke>
