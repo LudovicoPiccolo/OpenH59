@@ -30,6 +30,20 @@ LOCAL_TZ = ZoneInfo("Europe/Rome")
 RX = "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 TX = "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 
+# Canale "ricco" bc: storici dettagliati (SpO2 a slot, fasi del sonno) su caratteristiche
+# dedicate, protocollo a frame variabili:  bc | type(1) | len(2 LE) | crc16-modbus(2 LE) | body
+# (UUID e formato ricavati dal btsnoop dell'app ufficiale).
+BC_WRITE = "de5bf72a-d711-4e47-af26-65e3012a5dc7"
+BC_NOTIFY = "de5bf729-d711-4e47-af26-65e3012a5dc7"
+BC_MAGIC = 0xBC
+
+BC_LOGIN = 0x4A     # login con l'account dell'app
+BC_INIT = 0x30      # init/handshake
+BC_SLEEP = 0x27     # fasi del sonno
+BC_SPO2 = 0x2A      # SpO2 storica a slot
+
+SLEEP_STAGES = {2: "light", 3: "deep", 4: "rem", 5: "awake"}
+
 CMD_SET_TIME = 1
 CMD_BATTERY = 3
 CMD_HR_HISTORY = 21
@@ -37,6 +51,7 @@ CMD_HR_LOG = 22
 CMD_STRESS_HISTORY = 55
 CMD_HRV_HISTORY = 57
 CMD_STEPS = 67
+CMD_SLEEP_HISTORY = 13
 CMD_REALTIME = 105
 CMD_REALTIME_STOP = 106
 
@@ -51,6 +66,21 @@ class RT:
 
 def checksum(p: bytearray) -> int:
     return sum(p) & 255
+
+
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if (crc & 1) else crc >> 1
+    return crc
+
+
+def bc_frame(typ: int, body: bytes = b"") -> bytes:
+    """Costruisce un frame del canale ricco: bc | type | len | crc16-modbus | body."""
+    return (bytes([BC_MAGIC, typ]) + struct.pack("<H", len(body))
+            + struct.pack("<H", crc16_modbus(body)) + body)
 
 
 def make_packet(cmd: int, sub: bytes = b"") -> bytearray:
@@ -83,6 +113,34 @@ class BPResult:
     heart_rate: int | None = None
 
 
+@dataclass
+class SleepDay:
+    date: datetime          # mezzanotte del giorno (ora locale)
+    header: bytes           # frame header grezzo (per decodifica futura)
+    segments: list[int]     # byte-segmento grezzi del sonno (semantica da confermare)
+
+
+@dataclass
+class SleepSegment:
+    stage: str              # light | deep | rem | awake
+    minutes: int
+
+
+@dataclass
+class SleepDetail:
+    date: datetime              # giorno del sonno (mezzanotte, ora locale)
+    header: bytes               # 6 byte di header grezzo (start time ecc.)
+    segments: list[SleepSegment]
+    start: datetime | None = None   # istante d'inizio del sonno (stimato dall'header)
+
+    def totals(self) -> dict[str, int]:
+        out = {s: 0 for s in ("light", "deep", "rem", "awake")}
+        for seg in self.segments:
+            out[seg.stage] = out.get(seg.stage, 0) + seg.minutes
+        out["total"] = sum(s.minutes for s in self.segments)
+        return out
+
+
 class Band:
     def __init__(self, address: str):
         self.address = address
@@ -91,6 +149,9 @@ class Band:
         self._hist: list[bytes] = []
         self._collecting = False
         self._other: dict[int, bytes] = {}
+        self._bc_q: asyncio.Queue[bytes] = asyncio.Queue()
+        self._bc_buf = bytearray()
+        self._bc_ready = False
 
     async def __aenter__(self) -> "Band":
         device = await BleakScanner.find_device_by_address(self.address, timeout=15)
@@ -99,6 +160,11 @@ class Band:
         self.client = BleakClient(device, timeout=20)
         await self.client.connect()
         await self.client.start_notify(TX, self._on_tx)
+        try:
+            await self.client.start_notify(BC_NOTIFY, self._on_bc)
+            self._bc_ready = True
+        except Exception:
+            self._bc_ready = False  # firmware senza canale ricco: storici bc non disponibili
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -266,6 +332,138 @@ class Band:
     async def hrv_history(self, day: int = 0) -> list[tuple[datetime, int]]:
         """Curva dell'HRV (ms) del giorno (0=oggi), 1 valore per slot da 30 minuti."""
         return await self._slot_history(CMD_HRV_HISTORY, day)
+
+    async def sleep_history(self) -> list["SleepDay"]:
+        """Storico del sonno (cmd 13). Il device risponde con piu' giorni in un colpo solo:
+        per ogni giorno un frame header [13, 0x00, YY, MM, DD, 0x3c, ...] seguito da uno o piu'
+        frame dati [13, idx>=1, ...byte dei segmenti...]; 0xff chiude la lista.
+
+        NB: la semantica dei byte-segmento NON e' ancora confermata (osservati valori ~0x35-0x47).
+        Per ora restituiamo i byte grezzi per giorno: si decodificano con certezza confrontando
+        una notte intera con il grafico sonno dell'app ufficiale (stesso metodo usato per HR/passi).
+        """
+        packets = await self._request(CMD_SLEEP_HISTORY, wait=3.0)
+        days: list[SleepDay] = []
+        cur: SleepDay | None = None
+        for p in packets:
+            sub = p[1]
+            if sub == 0xff:
+                break
+            if sub == 0x00:
+                try:
+                    d = datetime(2000 + p[2], p[3], p[4], tzinfo=LOCAL_TZ)
+                except ValueError:
+                    cur = None
+                    continue
+                cur = SleepDay(date=d, header=bytes(p), segments=[])
+                days.append(cur)
+            elif cur is not None:
+                cur.segments.extend(p[2:15])
+        for d in days:  # togli lo zero-padding di coda
+            while d.segments and d.segments[-1] == 0:
+                d.segments.pop()
+        return days
+
+    # ---------- canale ricco bc: SpO2 storica + fasi del sonno ----------
+    def _on_bc(self, _, data: bytearray) -> None:
+        """Riassembla i frame bc (possono arrivare spezzati su piu' notifiche)."""
+        self._bc_buf += bytes(data)
+        while True:
+            i = self._bc_buf.find(BC_MAGIC)
+            if i < 0:
+                self._bc_buf.clear(); return
+            if i:
+                del self._bc_buf[:i]
+            if len(self._bc_buf) < 6:
+                return
+            ln = struct.unpack_from("<H", self._bc_buf, 2)[0]
+            total = 6 + ln
+            if len(self._bc_buf) < total:
+                return
+            frame = bytes(self._bc_buf[:total])
+            del self._bc_buf[:total]
+            self._bc_q.put_nowait(frame)
+
+    def _bc_drain(self) -> None:
+        while not self._bc_q.empty():
+            try:
+                self._bc_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _bc_send(self, typ: int, body: bytes = b"") -> None:
+        assert self.client is not None
+        await self.client.write_gatt_char(BC_WRITE, bc_frame(typ, body), response=False)
+
+    async def _bc_request(self, typ: int, body: bytes, wait: float = 4.0) -> bytes | None:
+        """Invia una richiesta bc e ritorna il body della risposta piu' lunga dello stesso type."""
+        self._bc_drain()
+        await self._bc_send(typ, body)
+        best = b""
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            try:
+                frame = await asyncio.wait_for(self._bc_q.get(), timeout=wait)
+            except asyncio.TimeoutError:
+                break
+            if frame[1] != typ:
+                continue
+            ln = struct.unpack_from("<H", frame, 2)[0]
+            fb = frame[6:6 + ln]
+            if len(fb) > len(best):
+                best = fb
+            if len(fb) > 3:   # risposta dati (non un semplice ack)
+                break
+        return best or None
+
+    async def _bc_login(self) -> bool:
+        """Handshake del canale ricco: login con l'account + init. True se sembra ok."""
+        from config import BAND_ACCOUNT
+        if not self._bc_ready:
+            return False
+        body = b"\x01\x01\x00" + BAND_ACCOUNT.encode("utf-16")  # 'utf-16' include il BOM ff fe
+        await self._bc_send(BC_LOGIN, body)
+        await asyncio.sleep(0.4)
+        await self._bc_send(BC_INIT)
+        await asyncio.sleep(0.4)
+        self._bc_drain()
+        return True
+
+    async def spo2_history(self, day: int = 0) -> list[tuple[datetime, int]]:
+        """Curva SpO2 storica del giorno (0=oggi, 1=ieri...): 1 valore ogni 15 minuti."""
+        if not await self._bc_login():
+            return []
+        body = await self._bc_request(BC_SPO2, bytes([(-day) & 0xFF]))
+        if not body or len(body) < 3:
+            return []
+        slots = body[2:]  # header: 01 00
+        base = datetime.fromtimestamp(midnight_ts(day), LOCAL_TZ)
+        return [(base + timedelta(minutes=15 * i), v) for i, v in enumerate(slots) if v]
+
+    async def sleep_detail(self, day: int = 0) -> "SleepDetail | None":
+        """Fasi del sonno del giorno: coppie (durata_min, fase). Fasi 2=leggero,3=profondo,4=REM,5=sveglio."""
+        if not await self._bc_login():
+            return None
+        body = await self._bc_request(BC_SLEEP, bytes([(-day) & 0xFF, 0x01]))
+        if not body or len(body) < 8:
+            return None
+        header, pairs = body[:6], body[6:]  # header: 01 00 + 4 byte (start ecc., da rifinire)
+        segs: list[SleepSegment] = []
+        for i in range(0, len(pairs) - 1, 2):
+            dur, stage = pairs[i], pairs[i + 1]
+            if dur and stage in SLEEP_STAGES:
+                segs.append(SleepSegment(SLEEP_STAGES[stage], dur))
+        if not segs:
+            return None
+        base = datetime.fromtimestamp(midnight_ts(day), LOCAL_TZ)
+        # Inizio sonno: u16 LE (header byte 2-3) = secondi dalle 20:00 del giorno prima.
+        # Calibrato sull'app ufficiale (header 2c29 -> 10540s -> 20:00+2h55 = 22:55).
+        try:
+            raw = struct.unpack_from("<H", header, 2)[0]
+            start = base - timedelta(hours=4) + timedelta(seconds=raw)
+        except Exception:
+            start = None
+        return SleepDetail(date=base, header=header, segments=segs, start=start)
 
     async def steps_history(self, day: int = 0) -> list[tuple[datetime, int, int, int]]:
         """Ritorna (timestamp, passi, calorie, distanza_m) per slot da 15 minuti."""

@@ -24,6 +24,9 @@ def _load_env(path: Path) -> None:
 _load_env(Path(__file__).with_name(".env"))
 
 BAND_ADDRESS = os.environ.get("BAND_ADDRESS", "")
+# Nome account usato dall'handshake del canale "ricco" bc (login type 0x4a).
+# E' lo username dell'app QWatch (parte prima della @ dell'email). Modificabile da .env.
+BAND_ACCOUNT = os.environ.get("BAND_ACCOUNT", "ludoplus")
 
 DB_CONFIG = dict(
     host=os.environ.get("DB_HOST", "127.0.0.1"),

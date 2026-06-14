@@ -45,6 +45,21 @@ SCHEMA = [
         ts   DATETIME NOT NULL PRIMARY KEY,
         ms   SMALLINT NOT NULL
     ) CHARACTER SET utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS spo2_samples (
+        ts    DATETIME NOT NULL PRIMARY KEY,
+        spo2  SMALLINT NOT NULL
+    ) CHARACTER SET utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS sleep_segments (
+        sleep_date  DATE NOT NULL,
+        idx         SMALLINT NOT NULL,
+        stage       VARCHAR(8) NOT NULL,
+        minutes     SMALLINT NOT NULL,
+        PRIMARY KEY (sleep_date, idx)
+    ) CHARACTER SET utf8mb4""",
+    """CREATE TABLE IF NOT EXISTS sleep_sessions (
+        sleep_date  DATE NOT NULL PRIMARY KEY,
+        start_ts    DATETIME NOT NULL
+    ) CHARACTER SET utf8mb4""",
 ]
 
 
@@ -117,6 +132,26 @@ class Store:
 
     def upsert_hrv(self, samples: list[tuple[datetime, int]]) -> int:
         return self._upsert_slot("hrv_samples", "ms", samples)
+
+    def upsert_spo2(self, samples: list[tuple[datetime, int]]) -> int:
+        return self._upsert_slot("spo2_samples", "spo2", samples)
+
+    def replace_sleep(self, sleep_date: str, segments: list[tuple[str, int]],
+                      start_ts: datetime | None = None) -> int:
+        """Sostituisce le fasi del sonno di un giorno (YYYY-MM-DD): lista di (stage, minutes).
+        start_ts = istante d'inizio del sonno (per posizionare l'asse orario)."""
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM sleep_segments WHERE sleep_date=%s", (sleep_date,))
+            cur.execute("DELETE FROM sleep_sessions WHERE sleep_date=%s", (sleep_date,))
+            if segments:
+                cur.executemany(
+                    "INSERT INTO sleep_segments (sleep_date, idx, stage, minutes) VALUES (%s,%s,%s,%s)",
+                    [(sleep_date, i, st, int(m)) for i, (st, m) in enumerate(segments)],
+                )
+            if start_ts is not None:
+                cur.execute("INSERT INTO sleep_sessions (sleep_date, start_ts) VALUES (%s,%s)",
+                            (sleep_date, self._fmt(start_ts)))
+        return len(segments)
 
     def close(self) -> None:
         self.conn.close()

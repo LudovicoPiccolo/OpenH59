@@ -28,7 +28,7 @@ def log(msg: str) -> None:
 async def run(address: str, mode: str, days: int) -> dict:
     result = {"ok": False, "battery": None, "measurements": [],
               "hr_points": 0, "step_points": 0, "stress_points": 0, "hrv_points": 0,
-              "errors": []}
+              "spo2_points": 0, "sleep_days": 0, "errors": []}
     store = Store()
     try:
         async with Band(address) as band:
@@ -83,8 +83,19 @@ async def run(address: str, mode: str, days: int) -> dict:
                         result["stress_points"] += store.upsert_stress(stress)
                         hrv = await band.hrv_history(d)
                         result["hrv_points"] += store.upsert_hrv(hrv)
+                        # canale ricco bc: SpO2 storica + fasi del sonno
+                        spo2 = await band.spo2_history(d)
+                        result["spo2_points"] += store.upsert_spo2(spo2)
+                        sleep = await band.sleep_detail(d)
+                        n_sleep = 0
+                        if sleep:
+                            store.replace_sleep(sleep.date.strftime("%Y-%m-%d"),
+                                                [(s.stage, s.minutes) for s in sleep.segments],
+                                                start_ts=sleep.start)
+                            result["sleep_days"] += 1
+                            n_sleep = len(sleep.segments)
                         log(f"Giorno -{d}: {len(hr)} punti battito, {len(st)} slot passi, "
-                            f"{len(stress)} stress, {len(hrv)} HRV")
+                            f"{len(stress)} stress, {len(hrv)} HRV, {len(spo2)} SpO2, {n_sleep} segmenti sonno")
                     except Exception as e:
                         result["errors"].append(f"storico giorno -{d}: {e}")
 

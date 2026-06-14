@@ -26,7 +26,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 - `start.command` — avvia la dashboard.
 
 ## Cosa si ottiene
-- **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min).
+- **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min), **SpO2 (15 min)** e **sonno a fasi** (leggero/profondo/REM/sveglio).
 - **On-demand** (misura del momento): battito, SpO2, pressione (sis/dia), stress.
 
 ## Requisiti
@@ -86,7 +86,8 @@ Mentre il Mac tiene aperta la dashboard, dal telefono (stessa rete Wi-Fi) apri
 ## Note
 - L'indirizzo BLE del braccialetto e le credenziali DB stanno nel `.env` (vedi `.env.example`).
 - Timestamp salvati in UTC.
-- La pressione e lo SpO2 non hanno storico sul dispositivo: sono misure del momento.
+- SpO2 e sonno hanno storico sul dispositivo (canale BLE "ricco" `bc`, vedi `band.py`): li scarichiamo come gli altri.
+- La **pressione** non ha uno storico reale sul dispositivo: la curva "oraria" mostrata dall'app ufficiale è generata lato app (valori quasi costanti). Da noi resta solo misura on-demand.
 
 ---
 
@@ -108,7 +109,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 - `start.command` — starts the dashboard.
 
 ## What you get
-- **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min).
+- **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min), **SpO2 (15 min)** and **staged sleep** (light/deep/REM/awake).
 - **On-demand** (instant measurement): heart rate, SpO2, blood pressure (sys/dia), stress.
 
 ## Requirements
@@ -168,7 +169,8 @@ While the Mac keeps the dashboard running, open `http://<Mac-IP>:8080` from your
 ## Notes
 - The band's BLE address and DB credentials live in `.env` (see `.env.example`).
 - Timestamps are stored in UTC.
-- Blood pressure and SpO2 have no on-device history: they are instant measurements only.
+- SpO2 and sleep have on-device history (the "rich" BLE `bc` channel, see `band.py`): we download them like the rest.
+- **Blood pressure** has no real on-device history: the "hourly" curve shown by the official app is generated app-side (near-constant values). On our side it stays on-demand only.
 
 ---
 

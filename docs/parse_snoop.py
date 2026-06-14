@@ -13,10 +13,11 @@ PATH = sys.argv[1] if len(sys.argv) > 1 else "btsnoop_hci.log"
 
 # nomi comandi gia' noti del protocollo (cmd = primo byte del frame)
 KNOWN = {
-    1: "set_time", 3: "battery", 8: "?", 20: "BP_history?", 21: "hr_history",
-    22: "hr_log_settings", 42: "spo2_history?", 55: "stress_history?",
-    57: "hrv_history?", 67: "steps", 68: "sleep?", 105: "realtime_start",
-    106: "realtime_stop",
+    1: "set_time", 3: "battery", 8: "?", 13: "sleep_history",
+    20: "BP_history (device non risponde: niente storico pressione)",
+    21: "hr_history", 22: "hr_log_settings", 42: "spo2_history?",
+    55: "stress_history", 57: "hrv_history", 67: "steps",
+    105: "realtime_start", 106: "realtime_stop",
 }
 
 

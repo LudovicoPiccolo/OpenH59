@@ -102,8 +102,9 @@ function tlocal($ts) {
 
 /* ---------- Lettura dati per la dashboard ---------- */
 $err = null;
-$latest = []; $hr = []; $steps = []; $recent = []; $stressHist = []; $hrv = [];
-$latestStress = false; $latestHrv = false;
+$latest = []; $hr = []; $steps = []; $recent = []; $stressHist = []; $hrv = []; $allrows = [];
+$spo2hist = []; $sleepSegs = []; $sleepDate = null; $sleepStart = null;
+$latestStress = false; $latestHrv = false; $latestSpo2 = false;
 $series = ['spo2' => [], 'blood_pressure' => []];
 try {
     $pdo = db();
@@ -117,8 +118,20 @@ try {
     foreach ($pdo->query("SELECT ts, steps FROM step_samples WHERE $cond ORDER BY ts") as $r) $steps[] = $r;
     foreach ($pdo->query("SELECT ts, score FROM stress_samples WHERE $cond ORDER BY ts") as $r) $stressHist[] = $r;
     foreach ($pdo->query("SELECT ts, ms FROM hrv_samples WHERE $cond ORDER BY ts") as $r) $hrv[] = $r;
+    foreach ($pdo->query("SELECT ts, spo2 FROM spo2_samples WHERE $cond ORDER BY ts") as $r) $spo2hist[] = $r;
     $latestStress = $pdo->query("SELECT score FROM stress_samples ORDER BY ts DESC LIMIT 1")->fetchColumn();
     $latestHrv    = $pdo->query("SELECT ms FROM hrv_samples ORDER BY ts DESC LIMIT 1")->fetchColumn();
+    $latestSpo2   = $pdo->query("SELECT spo2 FROM spo2_samples ORDER BY ts DESC LIMIT 1")->fetchColumn();
+    // sonno: ultimo giorno disponibile (le fasi sono per-giorno, non per-periodo)
+    $sleepDate = $pdo->query("SELECT MAX(sleep_date) FROM sleep_segments")->fetchColumn();
+    if ($sleepDate) {
+        $st = $pdo->prepare("SELECT idx, stage, minutes FROM sleep_segments WHERE sleep_date=? ORDER BY idx");
+        $st->execute([$sleepDate]);
+        $sleepSegs = $st->fetchAll();
+        $ss = $pdo->prepare("SELECT start_ts FROM sleep_sessions WHERE sleep_date=?");
+        $ss->execute([$sleepDate]);
+        $sleepStart = $ss->fetchColumn() ?: null;
+    }
     foreach (array_keys($series) as $metric) {
         $st = $pdo->prepare("SELECT ts, value, value2 FROM measurements
                              WHERE metric = ? AND $cond ORDER BY ts");
@@ -127,6 +140,14 @@ try {
     }
     $recent = $pdo->query("SELECT ts, metric, value, value2, unit FROM measurements
                            ORDER BY id DESC LIMIT 30")->fetchAll();
+    // tabella unica: tutti i dati salvati (storico + misure) del periodo, dal piu' recente
+    $allrows = $pdo->query(
+        "SELECT ts, 'Battito' tipo, bpm v1, NULL v2, NULL v3, 'bpm' unit FROM hr_samples WHERE $cond
+         UNION ALL SELECT ts, 'Passi', steps, calories, distance, 'passi' FROM step_samples WHERE $cond
+         UNION ALL SELECT ts, 'Stress', score, NULL, NULL, '' FROM stress_samples WHERE $cond
+         UNION ALL SELECT ts, 'HRV', ms, NULL, NULL, 'ms' FROM hrv_samples WHERE $cond
+         UNION ALL SELECT ts, metric, value, value2, NULL, unit FROM measurements WHERE $cond
+         ORDER BY ts DESC LIMIT 1000")->fetchAll();
 } catch (Throwable $e) {
     $err = $e->getMessage();
 }
@@ -136,6 +157,34 @@ function card_val($latest, $key, $suffix = '') {
     $r = $latest[$key];
     if ($key === 'blood_pressure') return intval($r['value']) . '/' . intval($r['value2']);
     return rtrim(rtrim(number_format($r['value'], 1, '.', ''), '0'), '.') . $suffix;
+}
+
+// etichetta italiana per il tipo di dato (le metriche on-demand sono in inglese nel DB)
+function tipo_label($t) {
+    return ['heart_rate'=>'Battito', 'blood_pressure'=>'Pressione', 'spo2'=>'SpO2',
+            'stress'=>'Stress', 'battery'=>'Batteria'][$t] ?? $t;
+}
+
+// totali sonno per fase (minuti) da una lista di segmenti
+function sleep_totals(array $segs): array {
+    $t = ['light'=>0, 'deep'=>0, 'rem'=>0, 'awake'=>0, 'total'=>0];
+    foreach ($segs as $s) { $t[$s['stage']] = ($t[$s['stage']] ?? 0) + (int)$s['minutes']; $t['total'] += (int)$s['minutes']; }
+    return $t;
+}
+function hhmm(int $min): string { return intdiv($min, 60) . 'h ' . str_pad($min % 60, 2, '0', STR_PAD_LEFT) . 'm'; }
+
+// valore formattato per la tabella unica
+function row_value($r) {
+    if ($r['tipo'] === 'Passi') {
+        $s = intval($r['v1']) . ' passi';
+        if ($r['v2'] !== null) $s .= ' · ' . intval($r['v2']) . ' kcal';
+        if ($r['v3'] !== null) $s .= ' · ' . intval($r['v3']) . ' m';
+        return $s;
+    }
+    if ($r['tipo'] === 'blood_pressure')
+        return intval($r['v1']) . '/' . intval($r['v2']) . ' mmHg';
+    $n = rtrim(rtrim(number_format($r['v1'], 1, '.', ''), '0'), '.');
+    return $n . ($r['unit'] ? ' ' . $r['unit'] : '');
 }
 ?>
 <!DOCTYPE html>
@@ -177,6 +226,17 @@ function card_val($latest, $key, $suffix = '') {
   th { color:var(--mut); font-weight:500; }
   .err { background:#3a1f24; color:#ffb4bd; padding:12px 16px; border-radius:10px; margin:10px 0; }
   .hint { color:var(--mut); font-size:13px; margin-top:6px; }
+  .hypno { display:flex; height:34px; border-radius:8px; overflow:hidden; margin:10px 0; background:#0f1419; }
+  .hypno .seg { height:100%; }
+  .seg-light { background:#5a9bff; } .seg-deep { background:#2b3f86; }
+  .seg-rem { background:#b07bff; } .seg-awake { background:#f5b73b; }
+  .sleepstats { display:flex; gap:18px; flex-wrap:wrap; margin-top:10px; font-size:14px; }
+  .sleepstats .dot { display:inline-block; width:10px; height:10px; border-radius:3px; margin-right:6px; vertical-align:middle; }
+  .sleepstats b { font-weight:600; }
+  .hypnoaxis { position:relative; height:26px; margin-top:1px; }
+  .hypnoaxis .tick { position:absolute; top:0; transform:translateX(-50%); color:var(--mut); font-size:12px; white-space:nowrap; }
+  .hypnoaxis .tick::before { content:''; display:block; width:1px; height:6px; background:#3a4654; margin:0 auto 2px; }
+  .sleeprange { color:var(--mut); font-size:15px; font-weight:600; margin-left:10px; }
 </style>
 </head>
 <body>
@@ -193,10 +253,11 @@ function card_val($latest, $key, $suffix = '') {
 
 <div class="cards">
   <div class="card"><div class="lbl">Battito</div><div class="big"><?= card_val($latest,'heart_rate') ?><span class="u"> bpm</span></div></div>
-  <div class="card"><div class="lbl">SpO2</div><div class="big"><?= card_val($latest,'spo2') ?><span class="u"> %</span></div></div>
+  <div class="card"><div class="lbl">SpO2</div><div class="big"><?= $latestSpo2 !== false ? intval($latestSpo2) : card_val($latest,'spo2') ?><span class="u"> %</span></div></div>
   <div class="card"><div class="lbl">Pressione</div><div class="big"><?= card_val($latest,'blood_pressure') ?><span class="u"> mmHg</span></div></div>
   <div class="card"><div class="lbl">Stress</div><div class="big"><?= $latestStress !== false ? intval($latestStress) : card_val($latest,'stress') ?></div></div>
   <div class="card"><div class="lbl">HRV</div><div class="big"><?= $latestHrv !== false ? intval($latestHrv) : '—' ?><span class="u"> ms</span></div></div>
+  <div class="card"><div class="lbl">Sonno</div><div class="big"><?php $tc = sleep_totals($sleepSegs); echo $tc['total'] ? intdiv($tc['total'],60).'<span class="u">h </span>'.($tc['total']%60).'<span class="u">m</span>' : '—'; ?></div></div>
   <div class="card"><div class="lbl">Batteria</div><div class="big"><?= card_val($latest,'battery') ?><span class="u"> %</span></div></div>
 </div>
 
@@ -257,6 +318,48 @@ function card_val($latest, $key, $suffix = '') {
   </div>
 </div>
 
+<?php $stot = sleep_totals($sleepSegs); ?>
+<div class="panel">
+  <h2>Sonno<?= $sleepDate ? ' · ' . htmlspecialchars(date('d/m/Y', strtotime($sleepDate))) : '' ?></h2>
+  <?php if ($sleepSegs):
+      $axisStart = $axisEnd = null; $ticks = [];
+      if ($sleepStart && $stot['total']) {
+          $axisStart = new DateTime($sleepStart, new DateTimeZone('UTC')); $axisStart->setTimezone($TZL);
+          $axisEnd = (clone $axisStart)->modify("+{$stot['total']} minutes");
+          $s0 = (int)$axisStart->format('U'); $s1 = (int)$axisEnd->format('U'); $span = max(1, $s1 - $s0);
+          for ($t = (int)(ceil($s0 / 3600) * 3600); $t < $s1; $t += 3600) {
+              $td = (new DateTime("@$t"))->setTimezone($TZL);
+              $ticks[] = [round(($t - $s0) / $span * 100, 3), $td->format('H:i')];
+          }
+      }
+  ?>
+    <div><span style="font-size:28px;font-weight:600"><?= hhmm($stot['total']) ?></span>
+      <?php if ($axisStart): ?><span class="sleeprange"><?= $axisStart->format('H:i') ?> → <?= $axisEnd->format('H:i') ?></span><?php endif; ?>
+    </div>
+    <div class="hypno">
+      <?php foreach ($sleepSegs as $s): $w = $stot['total'] ? round($s['minutes'] * 100 / $stot['total'], 3) : 0; ?>
+        <div class="seg seg-<?= htmlspecialchars($s['stage']) ?>" style="width:<?= $w ?>%"
+             title="<?= htmlspecialchars($s['stage']) ?> · <?= (int)$s['minutes'] ?> min"></div>
+      <?php endforeach; ?>
+    </div>
+    <?php if ($ticks): ?>
+    <div class="hypnoaxis">
+      <?php foreach ($ticks as [$pos, $lbl]): ?>
+        <span class="tick" style="left:<?= $pos ?>%"><?= htmlspecialchars($lbl) ?></span>
+      <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+    <div class="sleepstats">
+      <span><span class="dot" style="background:#5a9bff"></span>Leggero <b><?= hhmm($stot['light']) ?></b></span>
+      <span><span class="dot" style="background:#2b3f86"></span>Profondo <b><?= hhmm($stot['deep']) ?></b></span>
+      <span><span class="dot" style="background:#b07bff"></span>REM <b><?= hhmm($stot['rem']) ?></b></span>
+      <span><span class="dot" style="background:#f5b73b"></span>Sveglio <b><?= hhmm($stot['awake']) ?></b></span>
+    </div>
+  <?php else: ?>
+    <div class="hint">Nessun dato di sonno ancora. Indossa il braccialetto di notte, poi premi "Solo storico".</div>
+  <?php endif; ?>
+</div>
+
 <div class="panel">
   <h2>Misure recenti</h2>
   <table>
@@ -273,6 +376,20 @@ function card_val($latest, $key, $suffix = '') {
   </table>
 </div>
 
+<div class="panel">
+  <h2>Tutti i dati salvati · <?= htmlspecialchars($pl) ?></h2>
+  <table>
+    <tr><th>Quando</th><th>Tipo</th><th>Valore</th></tr>
+    <?php foreach ($allrows as $r): ?>
+      <tr><td><?= htmlspecialchars(tlocal($r['ts'])) ?></td>
+          <td><?= htmlspecialchars(tipo_label($r['tipo'])) ?></td>
+          <td><?= htmlspecialchars(row_value($r)) ?></td></tr>
+    <?php endforeach; ?>
+    <?php if (!$allrows): ?><tr><td colspan="3" style="color:var(--mut)">Nessun dato nel periodo selezionato.</td></tr><?php endif; ?>
+  </table>
+  <div class="hint"><?= count($allrows) ?> righe nel periodo selezionato (max 1000), dalla più recente. Cambia il periodo qui sopra per vedere più giorni.</div>
+</div>
+
 </div>
 
 <script>
@@ -284,8 +401,8 @@ const stepVals    = <?= json_encode(array_map(fn($r)=>(int)$r['steps'], $steps))
 const bpLabels    = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $series['blood_pressure'])) ?>;
 const bpSys       = <?= json_encode(array_map(fn($r)=>(int)$r['value'], $series['blood_pressure'])) ?>;
 const bpDia       = <?= json_encode(array_map(fn($r)=>(int)$r['value2'], $series['blood_pressure'])) ?>;
-const spo2Labels  = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $series['spo2'])) ?>;
-const spo2Vals    = <?= json_encode(array_map(fn($r)=>(int)$r['value'], $series['spo2'])) ?>;
+const spo2Labels  = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $spo2hist)) ?>;
+const spo2Vals    = <?= json_encode(array_map(fn($r)=>(int)$r['spo2'], $spo2hist)) ?>;
 const stressLabels= <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $stressHist)) ?>;
 const stressVals  = <?= json_encode(array_map(fn($r)=>(int)$r['score'], $stressHist)) ?>;
 const hrvLabels   = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $hrv)) ?>;
