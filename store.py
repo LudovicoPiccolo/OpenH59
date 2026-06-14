@@ -60,6 +60,18 @@ SCHEMA = [
         sleep_date  DATE NOT NULL PRIMARY KEY,
         start_ts    DATETIME NOT NULL
     ) CHARACTER SET utf8mb4""",
+    # Report dell'analisi AI (generati da index.php via OpenRouter)
+    """CREATE TABLE IF NOT EXISTS ai_report (
+        id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+        ts          DATETIME NOT NULL,
+        model       VARCHAR(64),
+        days        INT,
+        prompt      MEDIUMTEXT,
+        report      MEDIUMTEXT,
+        tokens_in   INT,
+        tokens_out  INT,
+        INDEX (ts)
+    ) CHARACTER SET utf8mb4""",
 ]
 
 

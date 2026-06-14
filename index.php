@@ -26,6 +26,8 @@ define('DB_HOST', getenv('DB_HOST') ?: '127.0.0.1');
 define('DB_NAME', getenv('DB_NAME') ?: 'ludohealt');
 define('DB_USER', getenv('DB_USER') ?: 'root');
 define('DB_PASS', getenv('DB_PASS') ?: '');
+define('OPENROUTER_API_KEY', getenv('OPENROUTER_API_KEY') ?: '');
+define('OPENROUTER_MODEL', getenv('OPENROUTER_MODEL') ?: 'deepseek/deepseek-v4-pro');
 
 function db(): PDO {
     $pdo = new PDO(
@@ -33,6 +35,62 @@ function db(): PDO {
         DB_USER, DB_PASS, [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
     );
     return $pdo;
+}
+
+/* ---------- AI: tabella report + chiamata a OpenRouter ---------- */
+function ensure_ai_report(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS ai_report (
+        id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+        ts          DATETIME NOT NULL,
+        model       VARCHAR(64),
+        days        INT,
+        prompt      MEDIUMTEXT,
+        report      MEDIUMTEXT,
+        tokens_in   INT,
+        tokens_out  INT,
+        INDEX (ts)
+    ) CHARACTER SET utf8mb4");
+}
+
+function openrouter_chat(string $prompt): array {
+    if (OPENROUTER_API_KEY === '') {
+        throw new RuntimeException('OPENROUTER_API_KEY mancante: aggiungila al file .env');
+    }
+    $payload = json_encode([
+        'model'    => OPENROUTER_MODEL,
+        'messages' => [['role' => 'user', 'content' => $prompt]],
+    ]);
+    $ch = curl_init('https://openrouter.ai/api/v1/chat/completions');
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $payload,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 180,
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . OPENROUTER_API_KEY,
+            'Content-Type: application/json',
+            'HTTP-Referer: http://127.0.0.1:8080',
+            'X-Title: LudoHealt',
+        ],
+    ]);
+    $resp = curl_exec($ch);
+    if ($resp === false) {
+        throw new RuntimeException('Errore di rete verso OpenRouter: ' . curl_error($ch));
+    }
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $j = json_decode($resp, true);
+    if ($code !== 200) {
+        throw new RuntimeException('OpenRouter ha risposto con errore: ' . ($j['error']['message'] ?? ('HTTP ' . $code)));
+    }
+    $content = $j['choices'][0]['message']['content'] ?? '';
+    if ($content === '') {
+        throw new RuntimeException('Risposta vuota da OpenRouter');
+    }
+    return [
+        'content'    => $content,
+        'tokens_in'  => $j['usage']['prompt_tokens'] ?? null,
+        'tokens_out' => $j['usage']['completion_tokens'] ?? null,
+    ];
 }
 
 /* ---------- Endpoint AJAX: lancia la sincronizzazione col braccialetto ---------- */
@@ -54,6 +112,145 @@ if (($_GET['action'] ?? '') === 'sync') {
         echo json_encode(['ok' => false, 'errors' => ['Nessuna risposta dal collettore. Vedi sync.log'], 'raw' => $json]);
     } else {
         echo $json;
+    }
+    exit;
+}
+
+/* ---------- Endpoint AJAX: genera il prompt per l'analisi AI (ultimi 365 giorni) ----------
+ * Aggrega i dati di salute dell'ultimo anno in un riepilogo giornaliero e costruisce
+ * un prompt in italiano per un modello AI. Per ora lo salva solo in prompt.txt; in
+ * futuro questo prompt verrà inviato a OpenRouter. */
+if (($_GET['action'] ?? '') === 'ai_prompt') {
+    set_time_limit(0);                 // la risposta del modello puo' richiedere diversi secondi
+    ignore_user_abort(true);
+    header('Content-Type: application/json');
+    try {
+        $pdo = db();
+        $startUtc  = (new DateTime('now', new DateTimeZone('UTC')))->modify('-365 day')->format('Y-m-d H:i:s');
+        $startDate = (new DateTime('now', new DateTimeZone('Europe/Rome')))->modify('-365 day')->format('Y-m-d');
+
+        // Raggruppamento per giorno locale (Europe/Rome) se le tabelle del fuso orario sono
+        // caricate in MySQL, altrimenti ripiego sul giorno UTC.
+        $tzOk = $pdo->query("SELECT CONVERT_TZ('2024-06-01 12:00:00','+00:00','Europe/Rome')")->fetchColumn() !== null;
+        $LD = $tzOk ? "DATE(CONVERT_TZ(ts,'+00:00','Europe/Rome'))" : "DATE(ts)";
+
+        $days = [];  // 'YYYY-MM-DD' => ['hr'=>..., 'spo2'=>..., 'sleep'=>..., ...]
+        $put = function (string $d, string $key, $val) use (&$days) {
+            if (!isset($days[$d])) $days[$d] = [];
+            $days[$d][$key] = $val;
+        };
+        $agg = function (string $sql) use ($pdo, $startUtc) {
+            $st = $pdo->prepare($sql);
+            $st->execute([$startUtc]);
+            return $st;
+        };
+
+        foreach ($agg("SELECT $LD d, ROUND(AVG(bpm)) a, MIN(bpm) mn, MAX(bpm) mx FROM hr_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'hr', $r);
+        foreach ($agg("SELECT $LD d, ROUND(AVG(spo2),1) a, MIN(spo2) mn FROM spo2_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'spo2', $r);
+        foreach ($agg("SELECT $LD d, ROUND(AVG(score)) a, MAX(score) mx FROM stress_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'stress', $r);
+        foreach ($agg("SELECT $LD d, ROUND(AVG(ms)) a FROM hrv_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'hrv', $r);
+        foreach ($agg("SELECT $LD d, SUM(steps) steps, SUM(calories) cal, SUM(distance) dist FROM step_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'steps', $r);
+        foreach ($agg("SELECT $LD d, ROUND(AVG(value)) sys, ROUND(AVG(value2)) dia FROM measurements WHERE metric='blood_pressure' AND ts >= ? GROUP BY d") as $r) $put($r['d'], 'bp', $r);
+
+        // Sonno: sleep_date è già una data locale; sommo i minuti per ciascuna fase.
+        $st = $pdo->prepare("SELECT sleep_date d, stage, SUM(minutes) m FROM sleep_segments WHERE sleep_date >= ? GROUP BY sleep_date, stage");
+        $st->execute([$startDate]);
+        foreach ($st as $r) {
+            $d = $r['d'];
+            if (!isset($days[$d]['sleep'])) $days[$d]['sleep'] = ['light'=>0,'deep'=>0,'rem'=>0,'awake'=>0,'total'=>0];
+            $days[$d]['sleep'][$r['stage']] = (int)$r['m'];
+            $days[$d]['sleep']['total'] += (int)$r['m'];
+        }
+        ksort($days);
+
+        // Helper per le statistiche annuali e per le celle del CSV.
+        $col = function (string $grp, string $key) use ($days) {
+            $out = [];
+            foreach ($days as $d) if (isset($d[$grp][$key]) && $d[$grp][$key] !== null) $out[] = (float)$d[$grp][$key];
+            return $out;
+        };
+        $num = fn($v) => $v === null ? '' : rtrim(rtrim(number_format((float)$v, 1, '.', ''), '0'), '.');
+        $avg = fn(array $a) => $a ? $num(array_sum($a) / count($a)) : '—';
+        $mn  = fn(array $a) => $a ? $num(min($a)) : '—';
+        $mx  = fn(array $a) => $a ? $num(max($a)) : '—';
+        $sum = fn(array $a) => $a ? $num(array_sum($a)) : '—';
+        $g   = function (array $row, string $grp, string $key) use ($num) {
+            return isset($row[$grp][$key]) && $row[$grp][$key] !== null ? $num($row[$grp][$key]) : '';
+        };
+
+        $first = $days ? array_key_first($days) : '—';
+        $last  = $days ? array_key_last($days)  : '—';
+        $sleepTotals = $col('sleep', 'total');
+
+        // ----- Costruzione del prompt -----
+        $P  = "SEI UN MEDICO E ANALISTA DI DATI SANITARI.\n\n";
+        $P .= "Analizza i dati di salute raccolti da un braccialetto fitness (modello H59) relativi a un singolo utente nell'ultimo anno. Valuta i dati esclusivamente dal punto di vista sanitario.\n\n";
+        $P .= "== ISTRUZIONI ==\n";
+        $P .= "1. Riassumi lo stato di salute generale che emerge dai dati.\n";
+        $P .= "2. Individua le tendenze nel tempo (miglioramenti o peggioramenti) per ciascuna metrica.\n";
+        $P .= "3. Segnala valori anomali o potenziali campanelli d'allarme (es. SpO2 bassa, battito a riposo elevato, HRV in calo, sonno insufficiente, pressione alta).\n";
+        $P .= "4. Evidenzia possibili correlazioni tra le metriche (es. stress alto ↔ HRV basso ↔ sonno scarso).\n";
+        $P .= "5. Fornisci consigli pratici e personalizzati per migliorare i parametri.\n";
+        $P .= "6. Indica chiaramente quando sarebbe opportuno consultare un medico.\n";
+        $P .= "Rispondi in italiano, in modo chiaro e comprensibile anche a un non esperto.\n";
+        $P .= "IMPORTANTE: questa è un'analisi informativa e NON sostituisce il parere di un medico.\n\n";
+        $P .= "== METRICHE E UNITÀ ==\n";
+        $P .= "- Battito (HR): battiti al minuto (bpm). A riposo tipico 60-100.\n";
+        $P .= "- SpO2: saturazione dell'ossigeno nel sangue (%). Normale >= 95%.\n";
+        $P .= "- Stress: indice 0-100 (più alto = più stress).\n";
+        $P .= "- HRV: variabilità della frequenza cardiaca (ms). Più alto = generalmente migliore.\n";
+        $P .= "- Passi / Calorie (kcal) / Distanza (m): attività fisica giornaliera.\n";
+        $P .= "- Sonno: minuti totali e suddivisione in fasi (leggero, profondo, REM, sveglio).\n";
+        $P .= "- Pressione (PA): sistolica/diastolica (mmHg). Riferimento ~120/80.\n\n";
+        $P .= "== RIEPILOGO PERIODO ==\n";
+        $P .= "Intervallo: dal $first al $last — " . count($days) . " giorni con dati.\n";
+        $P .= "Battito: media {$avg($col('hr','a'))} bpm (min giornaliero {$mn($col('hr','mn'))}, picco {$mx($col('hr','mx'))}).\n";
+        $P .= "SpO2: media {$avg($col('spo2','a'))}% (minimo {$mn($col('spo2','mn'))}%).\n";
+        $P .= "Stress: media {$avg($col('stress','a'))} (picco {$mx($col('stress','mx'))}).\n";
+        $P .= "HRV: media {$avg($col('hrv','a'))} ms.\n";
+        $P .= "Passi: totale {$sum($col('steps','steps'))}, media {$avg($col('steps','steps'))}/giorno.\n";
+        $P .= "Pressione: media {$avg($col('bp','sys'))}/{$avg($col('bp','dia'))} mmHg.\n";
+        $sleepAvgMin = $sleepTotals ? array_sum($sleepTotals) / count($sleepTotals) : null;
+        $P .= "Sonno: media " . ($sleepAvgMin !== null ? round($sleepAvgMin / 60, 1) . "h" : "—") . " a notte (" . count($sleepTotals) . " notti registrate).\n\n";
+        $P .= "== DATI GIORNALIERI (CSV) ==\n";
+        $P .= "data,hr_med,hr_min,hr_max,spo2_med,spo2_min,stress_med,stress_max,hrv_med,passi,kcal,dist_m,sonno_tot_min,sonno_leggero,sonno_profondo,sonno_rem,sonno_sveglio,pa_sist,pa_diast\n";
+        foreach ($days as $d => $row) {
+            $sl = $row['sleep'] ?? null;
+            $P .= implode(',', [
+                $d,
+                $g($row,'hr','a'), $g($row,'hr','mn'), $g($row,'hr','mx'),
+                $g($row,'spo2','a'), $g($row,'spo2','mn'),
+                $g($row,'stress','a'), $g($row,'stress','mx'),
+                $g($row,'hrv','a'),
+                $g($row,'steps','steps'), $g($row,'steps','cal'), $g($row,'steps','dist'),
+                $sl ? $sl['total'] : '', $sl ? $sl['light'] : '', $sl ? $sl['deep'] : '', $sl ? $sl['rem'] : '', $sl ? $sl['awake'] : '',
+                $g($row,'bp','sys'), $g($row,'bp','dia'),
+            ]) . "\n";
+        }
+        $P .= "== FINE DATI ==\n\nProcedi ora con l'analisi sanitaria seguendo le istruzioni qui sopra.\n";
+
+        @file_put_contents(__DIR__ . '/prompt.txt', $P);   // copia di debug del prompt inviato
+
+        // Chiamata al modello e salvataggio del report nel database.
+        $ai = openrouter_chat($P);
+        ensure_ai_report($pdo);
+        $st = $pdo->prepare("INSERT INTO ai_report (ts, model, days, prompt, report, tokens_in, tokens_out)
+                             VALUES (?,?,?,?,?,?,?)");
+        $st->execute([
+            (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
+            OPENROUTER_MODEL, count($days), $P, $ai['content'], $ai['tokens_in'], $ai['tokens_out'],
+        ]);
+        echo json_encode([
+            'ok'         => true,
+            'id'         => (int)$pdo->lastInsertId(),
+            'model'      => OPENROUTER_MODEL,
+            'days'       => count($days),
+            'tokens_in'  => $ai['tokens_in'],
+            'tokens_out' => $ai['tokens_out'],
+            'report'     => $ai['content'],
+        ]);
+    } catch (Throwable $e) {
+        echo json_encode(['ok' => false, 'errors' => [$e->getMessage()]]);
     }
     exit;
 }
@@ -152,6 +349,15 @@ try {
     $err = $e->getMessage();
 }
 
+// ultimo report AI salvato (try a parte: la tabella potrebbe non esistere ancora)
+$lastReport = null;
+if (isset($pdo)) {
+    try {
+        $lastReport = $pdo->query("SELECT ts, model, report, tokens_in, tokens_out
+                                   FROM ai_report ORDER BY id DESC LIMIT 1")->fetch();
+    } catch (Throwable $e) { /* nessun report ancora */ }
+}
+
 function card_val($latest, $key, $suffix = '') {
     if (!isset($latest[$key])) return '—';
     $r = $latest[$key];
@@ -220,7 +426,10 @@ function row_value($r) {
           border-radius:8px; padding:8px; }
   .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:18px; }
   button:disabled { opacity:.5; cursor:wait; }
-  #status { margin-top:12px; color:var(--mut); font-size:14px; white-space:pre-wrap; }
+  #status, #aistatus { margin-top:12px; color:var(--mut); font-size:14px; white-space:pre-wrap; }
+  code { background:#0f1419; border:1px solid #2a3540; border-radius:6px; padding:1px 6px; font-size:13px; }
+  .report { white-space:pre-wrap; line-height:1.55; font-size:14.5px; margin-top:12px; }
+  .report:empty { display:none; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   td,th { text-align:left; padding:7px 8px; border-bottom:1px solid #232c36; }
   th { color:var(--mut); font-weight:500; }
@@ -286,6 +495,22 @@ function row_value($r) {
   </div>
   <div class="hint">Indossa il braccialetto e tieni il Bluetooth del telefono spento. "Veloce" ≈ 1 min, "Completa" (con pressione e stress) ≈ 3 min.</div>
   <div id="status"></div>
+</div>
+
+<div class="panel">
+  <h2>Analisi AI</h2>
+  <div class="btns">
+    <button onclick="aiAnalyze()">🧠 Analizza con AI</button>
+  </div>
+  <div class="hint">Invia il riepilogo dei dati dell'ultimo anno (365 giorni) a <?= htmlspecialchars(OPENROUTER_MODEL) ?> via OpenRouter per un'analisi sanitaria. Il report viene salvato nel database (tabella <code>ai_report</code>). Può richiedere qualche secondo.</div>
+  <div id="aistatus"></div>
+  <?php if ($lastReport): ?>
+    <div id="aimeta" class="hint">Ultimo report · <?= htmlspecialchars(tlocal($lastReport['ts'])) ?> · <?= htmlspecialchars($lastReport['model']) ?><?= $lastReport['tokens_out'] ? ' · ' . (int)$lastReport['tokens_out'] . ' token' : '' ?></div>
+    <div id="aireport" class="report"><?= htmlspecialchars($lastReport['report']) ?></div>
+  <?php else: ?>
+    <div id="aimeta" class="hint" style="display:none"></div>
+    <div id="aireport" class="report"></div>
+  <?php endif; ?>
 </div>
 
 <?php $pl = $RANGES[$range]; ?>
@@ -463,6 +688,27 @@ async function sync(mode){
       if(j.errors && j.errors.length) msg += '\nNote: '+j.errors.join(' | ');
       s.textContent = msg + '\nAggiorno i grafici...';
       setTimeout(()=>location.reload(), 1200);
+    } else {
+      s.textContent = '✗ Errore: '+((j.errors||['sconosciuto']).join(' | '));
+    }
+  }catch(e){ s.textContent = '✗ Errore di rete: '+e; }
+  finally{ btns.forEach(b=>b.disabled=false); }
+}
+
+async function aiAnalyze(){
+  const btns = document.querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
+  const s = document.getElementById('aistatus');
+  s.textContent = 'Analisi in corso con il modello AI... (può richiedere qualche secondo)';
+  try{
+    const r = await fetch('?action=ai_prompt', {method:'POST'});
+    const j = await r.json();
+    if(j.ok){
+      s.textContent = '✓ Analisi completata · '+j.days+' giorni'
+        + (j.tokens_out ? ' · '+j.tokens_out+' token generati' : '')+' · salvata nel database (#'+j.id+').';
+      const meta = document.getElementById('aimeta');
+      meta.textContent = 'Ultimo report · adesso · '+j.model;
+      meta.style.display = '';
+      document.getElementById('aireport').textContent = j.report;
     } else {
       s.textContent = '✗ Errore: '+((j.errors||['sconosciuto']).join(' | '));
     }
