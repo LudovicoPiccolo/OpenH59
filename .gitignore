@@ -1,6 +1,9 @@
 # --- Dati personali / sensibili (NON pubblicare) ---
 # Log con misure di salute reali (pressione, battito, stress)
 sync.log
+# Dump grezzo del canale bc (BC_DEBUG=1): account + dati salute in chiaro
+bc_raw.log
+bc_*.log
 # Cattura grezza del traffico Bluetooth: MAC, seriali, dati salute
 docs/btsnoop_hci.log
 *.btsnoop

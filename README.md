@@ -26,7 +26,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 - `start.command` — avvia la dashboard.
 
 ## Cosa si ottiene
-- **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min), **SpO2 (15 min)** e **sonno a fasi** (leggero/profondo/REM/sveglio).
+- **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min), **SpO2 (oraria, min-max)** e **sonno a fasi** (leggero/profondo/REM/sveglio).
 - **On-demand** (misura del momento): battito, SpO2, pressione (sis/dia), stress.
 
 ## Requisiti
@@ -109,7 +109,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 - `start.command` — starts the dashboard.
 
 ## What you get
-- **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min), **SpO2 (15 min)** and **staged sleep** (light/deep/REM/awake).
+- **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min), **SpO2 (hourly, min-max)** and **staged sleep** (light/deep/REM/awake).
 - **On-demand** (instant measurement): heart rate, SpO2, blood pressure (sys/dia), stress.
 
 ## Requirements

@@ -5,6 +5,10 @@ e le stampa (NON salva nel DB). Serve a verificare l'handshake e il parsing dal 
 Indossa il braccialetto vicino al Mac, Bluetooth del telefono SPENTO, poi:
     .venv/bin/python bc_test.py            # oggi
     .venv/bin/python bc_test.py --day 1    # ieri
+
+Per il confronto byte-per-byte con l'app ufficiale, attiva il dump dei frame grezzi
+(TX/RX del canale bc) su stderr e salvalo su file:
+    BC_DEBUG=1 .venv/bin/python bc_test.py --day 1 2> bc_raw.log
 """
 import argparse
 import asyncio
