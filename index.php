@@ -40,26 +40,45 @@ function db(): PDO {
 /* ---------- AI: tabella report + chiamata a OpenRouter ---------- */
 function ensure_ai_report(PDO $pdo): void {
     $pdo->exec("CREATE TABLE IF NOT EXISTS ai_report (
-        id          BIGINT AUTO_INCREMENT PRIMARY KEY,
-        ts          DATETIME NOT NULL,
-        model       VARCHAR(64),
-        days        INT,
-        prompt      MEDIUMTEXT,
-        report      MEDIUMTEXT,
-        tokens_in   INT,
-        tokens_out  INT,
+        id            BIGINT AUTO_INCREMENT PRIMARY KEY,
+        ts            DATETIME NOT NULL,
+        model         VARCHAR(64),
+        days          INT,
+        prompt        MEDIUMTEXT,
+        report_short  MEDIUMTEXT,
+        report        MEDIUMTEXT,
+        tokens_in     INT,
+        tokens_out    INT,
         INDEX (ts)
     ) CHARACTER SET utf8mb4");
+    // migrazione per tabelle create prima dell'aggiunta dell'analisi veloce
+    if (!$pdo->query("SHOW COLUMNS FROM ai_report LIKE 'report_short'")->fetch()) {
+        $pdo->exec("ALTER TABLE ai_report ADD COLUMN report_short MEDIUMTEXT AFTER days");
+    }
 }
 
-function openrouter_chat(string $prompt): array {
+/* Ripulisce l'HTML prodotto dal modello prima di salvarlo/mostrarlo:
+ * toglie eventuali fence Markdown, il wrapper di documento e i tag/attributi non sicuri. */
+function clean_ai_html(string $s): string {
+    $s = trim($s);
+    $s = preg_replace('/^```[a-zA-Z]*\s*/', '', $s);   // ```html iniziale
+    $s = preg_replace('/\s*```$/', '', $s);            // ``` finale
+    if (preg_match('/<body[^>]*>(.*)<\/body>/is', $s, $m)) $s = $m[1];  // tiene solo il body
+    $s = preg_replace('#<(script|style)\b[^>]*>.*?</\1>#is', '', $s);   // via script/style
+    $s = preg_replace('/\son\w+\s*=\s*("[^"]*"|\'[^\']*\')/i', '', $s); // via handler inline on*=
+    return trim($s);
+}
+
+function openrouter_chat(string $prompt, bool $json = false): array {
     if (OPENROUTER_API_KEY === '') {
         throw new RuntimeException('OPENROUTER_API_KEY mancante: aggiungila al file .env');
     }
-    $payload = json_encode([
+    $body = [
         'model'    => OPENROUTER_MODEL,
         'messages' => [['role' => 'user', 'content' => $prompt]],
-    ]);
+    ];
+    if ($json) $body['response_format'] = ['type' => 'json_object'];
+    $payload = json_encode($body);
     $ch = curl_init('https://openrouter.ai/api/v1/chat/completions');
     curl_setopt_array($ch, [
         CURLOPT_POST           => true,
@@ -194,6 +213,15 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $P .= "6. Indica chiaramente quando sarebbe opportuno consultare un medico.\n";
         $P .= "Rispondi in italiano, in modo chiaro e comprensibile anche a un non esperto.\n";
         $P .= "IMPORTANTE: questa è un'analisi informativa e NON sostituisce il parere di un medico.\n\n";
+        $P .= "== FORMATO DELLA RISPOSTA ==\n";
+        $P .= "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido (nessun testo fuori dal JSON, nessun fence ```), con esattamente queste due chiavi:\n";
+        $P .= "{\"analisi_veloce\": \"...\", \"analisi_completa\": \"...\"}\n";
+        $P .= "- \"analisi_veloce\": riassunto SINTETICO (massimo ~120 parole) con i 2-4 punti più importanti ed eventuali campanelli d'allarme.\n";
+        $P .= "- \"analisi_completa\": analisi dettagliata che copre tutti i 6 punti delle istruzioni qui sopra.\n";
+        $P .= "Il valore di ENTRAMBE le chiavi deve essere HTML vanilla (niente Markdown), usando solo i tag: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <br>, <table>, <thead>, <tbody>, <tr>, <th>, <td>.\n";
+        $P .= "Nella completa usa <h3> per ciascuna sezione e <table> per i confronti numerici.\n";
+        $P .= "NON includere CSS inline, attributi style, i tag <html>/<head>/<body>/<style>/<script>, immagini o link esterni.\n";
+        $P .= "Fai l'escape delle virgolette interne all'HTML come richiesto dal formato JSON. Tutto il testo in italiano.\n\n";
         $P .= "== METRICHE E UNITÀ ==\n";
         $P .= "- Battito (HR): battiti al minuto (bpm). A riposo tipico 60-100.\n";
         $P .= "- SpO2: saturazione dell'ossigeno nel sangue (%). Normale >= 95%.\n";
@@ -231,14 +259,26 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
 
         @file_put_contents(__DIR__ . '/prompt.txt', $P);   // copia di debug del prompt inviato
 
-        // Chiamata al modello e salvataggio del report nel database.
-        $ai = openrouter_chat($P);
+        // Chiamata al modello: attesa un JSON con analisi_veloce + analisi_completa.
+        $ai = openrouter_chat($P, true);
+        $content = preg_replace('/^```[a-zA-Z]*\s*/', '', trim($ai['content']));
+        $content = preg_replace('/\s*```$/', '', $content);
+        $parsed = json_decode($content, true);
+        if (is_array($parsed) && isset($parsed['analisi_veloce'], $parsed['analisi_completa'])) {
+            $short = clean_ai_html((string)$parsed['analisi_veloce']);
+            $full  = clean_ai_html((string)$parsed['analisi_completa']);
+        } else {
+            // fallback: il modello non ha restituito il JSON atteso
+            $full  = clean_ai_html($content);
+            $short = $full;
+        }
+
         ensure_ai_report($pdo);
-        $st = $pdo->prepare("INSERT INTO ai_report (ts, model, days, prompt, report, tokens_in, tokens_out)
-                             VALUES (?,?,?,?,?,?,?)");
+        $st = $pdo->prepare("INSERT INTO ai_report (ts, model, days, prompt, report_short, report, tokens_in, tokens_out)
+                             VALUES (?,?,?,?,?,?,?,?)");
         $st->execute([
             (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
-            OPENROUTER_MODEL, count($days), $P, $ai['content'], $ai['tokens_in'], $ai['tokens_out'],
+            OPENROUTER_MODEL, count($days), $P, $short, $full, $ai['tokens_in'], $ai['tokens_out'],
         ]);
         echo json_encode([
             'ok'         => true,
@@ -247,7 +287,8 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
             'days'       => count($days),
             'tokens_in'  => $ai['tokens_in'],
             'tokens_out' => $ai['tokens_out'],
-            'report'     => $ai['content'],
+            'short'      => $short,
+            'full'       => $full,
         ]);
     } catch (Throwable $e) {
         echo json_encode(['ok' => false, 'errors' => [$e->getMessage()]]);
@@ -353,7 +394,7 @@ try {
 $lastReport = null;
 if (isset($pdo)) {
     try {
-        $lastReport = $pdo->query("SELECT ts, model, report, tokens_in, tokens_out
+        $lastReport = $pdo->query("SELECT ts, model, report_short, report, tokens_in, tokens_out
                                    FROM ai_report ORDER BY id DESC LIMIT 1")->fetch();
     } catch (Throwable $e) { /* nessun report ancora */ }
 }
@@ -428,8 +469,17 @@ function row_value($r) {
   button:disabled { opacity:.5; cursor:wait; }
   #status, #aistatus { margin-top:12px; color:var(--mut); font-size:14px; white-space:pre-wrap; }
   code { background:#0f1419; border:1px solid #2a3540; border-radius:6px; padding:1px 6px; font-size:13px; }
-  .report { white-space:pre-wrap; line-height:1.55; font-size:14.5px; margin-top:12px; }
+  .report { line-height:1.55; font-size:14.5px; margin-top:12px; }
   .report:empty { display:none; }
+  .report h3 { font-size:17px; margin:20px 0 8px; color:var(--acc); }
+  .report h3:first-child { margin-top:4px; }
+  .report h4 { font-size:15px; margin:14px 0 6px; }
+  .report p { margin:8px 0; }
+  .report ul, .report ol { margin:8px 0; padding-left:22px; }
+  .report li { margin:4px 0; }
+  .report table { width:100%; border-collapse:collapse; margin:12px 0; font-size:14px; }
+  .report th, .report td { text-align:left; padding:7px 8px; border-bottom:1px solid #232c36; }
+  .report th { color:var(--mut); font-weight:600; }
   table { width:100%; border-collapse:collapse; font-size:14px; }
   td,th { text-align:left; padding:7px 8px; border-bottom:1px solid #232c36; }
   th { color:var(--mut); font-weight:500; }
@@ -504,13 +554,12 @@ function row_value($r) {
   </div>
   <div class="hint">Invia il riepilogo dei dati dell'ultimo anno (365 giorni) a <?= htmlspecialchars(OPENROUTER_MODEL) ?> via OpenRouter per un'analisi sanitaria. Il report viene salvato nel database (tabella <code>ai_report</code>). Può richiedere qualche secondo.</div>
   <div id="aistatus"></div>
-  <?php if ($lastReport): ?>
-    <div id="aimeta" class="hint">Ultimo report · <?= htmlspecialchars(tlocal($lastReport['ts'])) ?> · <?= htmlspecialchars($lastReport['model']) ?><?= $lastReport['tokens_out'] ? ' · ' . (int)$lastReport['tokens_out'] . ' token' : '' ?></div>
-    <div id="aireport" class="report"><?= htmlspecialchars($lastReport['report']) ?></div>
-  <?php else: ?>
-    <div id="aimeta" class="hint" style="display:none"></div>
-    <div id="aireport" class="report"></div>
-  <?php endif; ?>
+  <?php $lrShort = $lastReport ? ($lastReport['report_short'] ?: $lastReport['report']) : '';
+        $lrFull  = $lastReport ? $lastReport['report'] : ''; ?>
+  <div id="aimeta" class="hint"<?= $lastReport ? '' : ' style="display:none"' ?>><?php if ($lastReport): ?>Ultimo report · <?= htmlspecialchars(tlocal($lastReport['ts'])) ?> · <?= htmlspecialchars($lastReport['model']) ?><?= $lastReport['tokens_out'] ? ' · ' . (int)$lastReport['tokens_out'] . ' token' : '' ?><?php endif; ?></div>
+  <div id="aireport" class="report"><?= $lrShort ?></div>
+  <button type="button" id="aitoggle" class="alt" onclick="toggleFull()" style="margin-top:12px;<?= $lastReport ? '' : 'display:none' ?>">Vedi analisi completa</button>
+  <div id="aifull" class="report" style="display:none"><?= $lrFull ?></div>
 </div>
 
 <?php $pl = $RANGES[$range]; ?>
@@ -708,12 +757,24 @@ async function aiAnalyze(){
       const meta = document.getElementById('aimeta');
       meta.textContent = 'Ultimo report · adesso · '+j.model;
       meta.style.display = '';
-      document.getElementById('aireport').textContent = j.report;
+      document.getElementById('aireport').innerHTML = j.short;
+      const full = document.getElementById('aifull');
+      full.innerHTML = j.full; full.style.display = 'none';
+      const tog = document.getElementById('aitoggle');
+      tog.textContent = 'Vedi analisi completa'; tog.style.display = '';
     } else {
       s.textContent = '✗ Errore: '+((j.errors||['sconosciuto']).join(' | '));
     }
   }catch(e){ s.textContent = '✗ Errore di rete: '+e; }
   finally{ btns.forEach(b=>b.disabled=false); }
+}
+
+function toggleFull(){
+  const f = document.getElementById('aifull');
+  const b = document.getElementById('aitoggle');
+  const hidden = (f.style.display === 'none');
+  f.style.display = hidden ? '' : 'none';
+  b.textContent = hidden ? 'Nascondi analisi completa' : 'Vedi analisi completa';
 }
 </script>
 </body>
