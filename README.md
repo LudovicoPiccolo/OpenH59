@@ -76,8 +76,10 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 ## Uso quotidiano
 1. **Indossa il braccialetto** e **spegni il Bluetooth del telefono** (il braccialetto parla con un solo dispositivo per volta).
 2. Avvia la dashboard (`bash start.command`) e apri http://127.0.0.1:8080.
-3. Premi **Misura veloce** (~1 min) / **Misura completa** (~3 min, con pressione e stress) / **Solo storico** (~10 s).
+3. Premi **Misura veloce** (~2-3 min) / **Misura completa** (~4-5 min, con pressione e stress) / **Solo storico** (~2 min).
 4. (Opzionale) Premi **Analisi AI** per inviare il riepilogo dell'ultimo anno a OpenRouter e ricevere il report sui tuoi trend.
+
+> **Sincronizzazione incrementale:** ogni sync riparte dall'ultimo dato salvato nel database e scarica solo i giorni mancanti. Sync quotidiano → istantaneo; se stai via qualche giorno col braccialetto al polso, al rientro un solo sync recupera in automatico tutto il buffer (il device tiene i dati ~7 giorni; ri-scaricarli non crea doppioni). Override manuali: `collect.py --days 7` o `collect.py --from 2026-06-10T08:00`.
 
 ### Dal cellulare
 Mentre il Mac tiene aperta la dashboard, dal telefono (stessa rete Wi-Fi) apri
@@ -162,8 +164,10 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 ## Daily use
 1. **Wear the band** and **turn off your phone's Bluetooth** (the band talks to one device at a time).
 2. Start the dashboard (`bash start.command`) and open http://127.0.0.1:8080.
-3. Press **Quick measure** (~1 min) / **Full measure** (~3 min, with blood pressure and stress) / **History only** (~10 s).
+3. Press **Quick measure** (~2-3 min) / **Full measure** (~4-5 min, with blood pressure and stress) / **History only** (~2 min).
 4. (Optional) Press **AI analysis** to send the last year's summary to OpenRouter and get a report on your trends.
+
+> **Incremental sync:** each sync resumes from the last data point in the database and downloads only the missing days. Daily sync → instant; if you're away for a few days while still wearing the band, a single sync on your return automatically recovers the whole buffer (the device holds ~7 days; re-downloading creates no duplicates). Manual overrides: `collect.py --days 7` or `collect.py --from 2026-06-10T08:00`.
 
 ### From your phone
 While the Mac keeps the dashboard running, open `http://<Mac-IP>:8080` from your phone

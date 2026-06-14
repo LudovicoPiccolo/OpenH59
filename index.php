@@ -47,13 +47,16 @@ function ensure_ai_report(PDO $pdo): void {
         prompt        MEDIUMTEXT,
         report_short  MEDIUMTEXT,
         report        MEDIUMTEXT,
+        report_diet   MEDIUMTEXT,
         tokens_in     INT,
         tokens_out    INT,
         INDEX (ts)
     ) CHARACTER SET utf8mb4");
-    // migrazione per tabelle create prima dell'aggiunta dell'analisi veloce
-    if (!$pdo->query("SHOW COLUMNS FROM ai_report LIKE 'report_short'")->fetch()) {
-        $pdo->exec("ALTER TABLE ai_report ADD COLUMN report_short MEDIUMTEXT AFTER days");
+    // migrazioni per tabelle create prima dell'aggiunta delle nuove colonne
+    foreach (['report_short' => 'days', 'report_diet' => 'report'] as $colName => $after) {
+        if (!$pdo->query("SHOW COLUMNS FROM ai_report LIKE '$colName'")->fetch()) {
+            $pdo->exec("ALTER TABLE ai_report ADD COLUMN $colName MEDIUMTEXT AFTER $after");
+        }
     }
 }
 
@@ -84,7 +87,7 @@ function openrouter_chat(string $prompt, bool $json = false): array {
         CURLOPT_POST           => true,
         CURLOPT_POSTFIELDS     => $payload,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_TIMEOUT        => 180,
+        CURLOPT_TIMEOUT        => 300,
         CURLOPT_HTTPHEADER     => [
             'Authorization: Bearer ' . OPENROUTER_API_KEY,
             'Content-Type: application/json',
@@ -214,11 +217,12 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $P .= "Rispondi in italiano, in modo chiaro e comprensibile anche a un non esperto.\n";
         $P .= "IMPORTANTE: questa è un'analisi informativa e NON sostituisce il parere di un medico.\n\n";
         $P .= "== FORMATO DELLA RISPOSTA ==\n";
-        $P .= "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido (nessun testo fuori dal JSON, nessun fence ```), con esattamente queste due chiavi:\n";
-        $P .= "{\"analisi_veloce\": \"...\", \"analisi_completa\": \"...\"}\n";
+        $P .= "Rispondi ESCLUSIVAMENTE con un oggetto JSON valido (nessun testo fuori dal JSON, nessun fence ```), con esattamente queste tre chiavi:\n";
+        $P .= "{\"analisi_veloce\": \"...\", \"analisi_completa\": \"...\", \"consigli_alimentari\": \"...\"}\n";
         $P .= "- \"analisi_veloce\": riassunto SINTETICO (massimo ~120 parole) con i 2-4 punti più importanti ed eventuali campanelli d'allarme.\n";
         $P .= "- \"analisi_completa\": analisi dettagliata che copre tutti i 6 punti delle istruzioni qui sopra.\n";
-        $P .= "Il valore di ENTRAMBE le chiavi deve essere HTML vanilla (niente Markdown), usando solo i tag: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <br>, <table>, <thead>, <tbody>, <tr>, <th>, <td>.\n";
+        $P .= "- \"consigli_alimentari\": consigli pratici di alimentazione ed eventuali integratori, basati SPECIFICAMENTE sui dati di questo utente (es. HRV, stress, sonno, battito, attività fisica). Per ogni alimento/integratore spiega brevemente a cosa serve in relazione ai dati osservati. Ricorda che gli integratori vanno assunti solo dopo aver consultato un medico e non sostituiscono una dieta equilibrata.\n";
+        $P .= "Il valore di TUTTE e tre le chiavi deve essere HTML vanilla (niente Markdown), usando solo i tag: <h3>, <h4>, <p>, <ul>, <ol>, <li>, <strong>, <em>, <br>, <table>, <thead>, <tbody>, <tr>, <th>, <td>.\n";
         $P .= "Nella completa usa <h3> per ciascuna sezione e <table> per i confronti numerici.\n";
         $P .= "NON includere CSS inline, attributi style, i tag <html>/<head>/<body>/<style>/<script>, immagini o link esterni.\n";
         $P .= "Fai l'escape delle virgolette interne all'HTML come richiesto dal formato JSON. Tutto il testo in italiano.\n\n";
@@ -267,18 +271,20 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         if (is_array($parsed) && isset($parsed['analisi_veloce'], $parsed['analisi_completa'])) {
             $short = clean_ai_html((string)$parsed['analisi_veloce']);
             $full  = clean_ai_html((string)$parsed['analisi_completa']);
+            $diet  = clean_ai_html((string)($parsed['consigli_alimentari'] ?? ''));
         } else {
             // fallback: il modello non ha restituito il JSON atteso
             $full  = clean_ai_html($content);
             $short = $full;
+            $diet  = '';
         }
 
         ensure_ai_report($pdo);
-        $st = $pdo->prepare("INSERT INTO ai_report (ts, model, days, prompt, report_short, report, tokens_in, tokens_out)
-                             VALUES (?,?,?,?,?,?,?,?)");
+        $st = $pdo->prepare("INSERT INTO ai_report (ts, model, days, prompt, report_short, report, report_diet, tokens_in, tokens_out)
+                             VALUES (?,?,?,?,?,?,?,?,?)");
         $st->execute([
             (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s'),
-            OPENROUTER_MODEL, count($days), $P, $short, $full, $ai['tokens_in'], $ai['tokens_out'],
+            OPENROUTER_MODEL, count($days), $P, $short, $full, $diet, $ai['tokens_in'], $ai['tokens_out'],
         ]);
         echo json_encode([
             'ok'         => true,
@@ -289,6 +295,7 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
             'tokens_out' => $ai['tokens_out'],
             'short'      => $short,
             'full'       => $full,
+            'diet'       => $diet,
         ]);
     } catch (Throwable $e) {
         echo json_encode(['ok' => false, 'errors' => [$e->getMessage()]]);
@@ -394,7 +401,7 @@ try {
 $lastReport = null;
 if (isset($pdo)) {
     try {
-        $lastReport = $pdo->query("SELECT ts, model, report_short, report, tokens_in, tokens_out
+        $lastReport = $pdo->query("SELECT ts, model, report_short, report, report_diet, tokens_in, tokens_out
                                    FROM ai_report ORDER BY id DESC LIMIT 1")->fetch();
     } catch (Throwable $e) { /* nessun report ancora */ }
 }
@@ -555,11 +562,16 @@ function row_value($r) {
   <div class="hint">Invia il riepilogo dei dati dell'ultimo anno (365 giorni) a <?= htmlspecialchars(OPENROUTER_MODEL) ?> via OpenRouter per un'analisi sanitaria. Il report viene salvato nel database (tabella <code>ai_report</code>). Può richiedere qualche secondo.</div>
   <div id="aistatus"></div>
   <?php $lrShort = $lastReport ? ($lastReport['report_short'] ?: $lastReport['report']) : '';
-        $lrFull  = $lastReport ? $lastReport['report'] : ''; ?>
+        $lrFull  = $lastReport ? $lastReport['report'] : '';
+        $lrDiet  = $lastReport ? ($lastReport['report_diet'] ?? '') : ''; ?>
   <div id="aimeta" class="hint"<?= $lastReport ? '' : ' style="display:none"' ?>><?php if ($lastReport): ?>Ultimo report · <?= htmlspecialchars(tlocal($lastReport['ts'])) ?> · <?= htmlspecialchars($lastReport['model']) ?><?= $lastReport['tokens_out'] ? ' · ' . (int)$lastReport['tokens_out'] . ' token' : '' ?><?php endif; ?></div>
   <div id="aireport" class="report"><?= $lrShort ?></div>
-  <button type="button" id="aitoggle" class="alt" onclick="toggleFull()" style="margin-top:12px;<?= $lastReport ? '' : 'display:none' ?>">Vedi analisi completa</button>
+  <div class="btns" id="aibtns" style="margin-top:12px;<?= $lastReport ? '' : 'display:none' ?>">
+    <button type="button" class="alt" data-label="analisi completa" onclick="toggleBox('aifull', this)">Vedi analisi completa</button>
+    <button type="button" class="alt" data-label="consigli alimentari e integratori" onclick="toggleBox('aidiet', this)"<?= $lrDiet ? '' : ' style="display:none"' ?>>Vedi consigli alimentari e integratori</button>
+  </div>
   <div id="aifull" class="report" style="display:none"><?= $lrFull ?></div>
+  <div id="aidiet" class="report" style="display:none"><?= $lrDiet ?></div>
 </div>
 
 <?php $pl = $RANGES[$range]; ?>
@@ -732,7 +744,8 @@ async function sync(mode){
       if(j.battery) msg += 'Batteria '+j.battery.level+'%. ';
       if(j.measurements && j.measurements.length) msg += j.measurements.map(m=>
           m.metric==='blood_pressure' ? ('pressione '+m.value+'/'+m.value2) : (m.metric+' '+m.value)).join(', ')+'. ';
-      msg += 'Storico: '+j.hr_points+' punti battito, '+j.step_points+' slot passi, '
+      const span = (j.days_synced!=null) ? (j.days_synced===0 ? 'solo oggi' : ('ultimi '+(j.days_synced+1)+' giorni')) : '';
+      msg += 'Storico'+(span?' ('+span+')':'')+': '+j.hr_points+' punti battito, '+j.step_points+' slot passi, '
            + (j.stress_points||0)+' stress, '+(j.hrv_points||0)+' HRV.';
       if(j.errors && j.errors.length) msg += '\nNote: '+j.errors.join(' | ');
       s.textContent = msg + '\nAggiorno i grafici...';
@@ -758,10 +771,12 @@ async function aiAnalyze(){
       meta.textContent = 'Ultimo report · adesso · '+j.model;
       meta.style.display = '';
       document.getElementById('aireport').innerHTML = j.short;
-      const full = document.getElementById('aifull');
-      full.innerHTML = j.full; full.style.display = 'none';
-      const tog = document.getElementById('aitoggle');
-      tog.textContent = 'Vedi analisi completa'; tog.style.display = '';
+      const full = document.getElementById('aifull'); full.innerHTML = j.full; full.style.display = 'none';
+      const diet = document.getElementById('aidiet'); diet.innerHTML = j.diet || ''; diet.style.display = 'none';
+      const bx = document.getElementById('aibtns'); bx.style.display = '';
+      bx.querySelectorAll('button').forEach(b => b.textContent = 'Vedi ' + b.dataset.label);
+      bx.querySelector('[data-label="consigli alimentari e integratori"]').style.display =
+        (j.diet && j.diet.trim()) ? '' : 'none';
     } else {
       s.textContent = '✗ Errore: '+((j.errors||['sconosciuto']).join(' | '));
     }
@@ -769,12 +784,11 @@ async function aiAnalyze(){
   finally{ btns.forEach(b=>b.disabled=false); }
 }
 
-function toggleFull(){
-  const f = document.getElementById('aifull');
-  const b = document.getElementById('aitoggle');
+function toggleBox(boxId, btn){
+  const f = document.getElementById(boxId);
   const hidden = (f.style.display === 'none');
   f.style.display = hidden ? '' : 'none';
-  b.textContent = hidden ? 'Nascondi analisi completa' : 'Vedi analisi completa';
+  btn.textContent = (hidden ? 'Nascondi ' : 'Vedi ') + btn.dataset.label;
 }
 </script>
 </body>

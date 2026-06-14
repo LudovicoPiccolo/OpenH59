@@ -5,31 +5,71 @@ Si connette al braccialetto, scarica lo storico (battito + passi) e fa le misure
 on-demand (battito, SpO2, pressione, stress), salva tutto su MySQL `ludohealt`.
 Stampa un riepilogo JSON sull'ultima riga (usato dalla pagina index.php).
 
+Storico INCREMENTALE: di default riparte dall'ultimo dato salvato nel DB (MAX(ts)) e
+scarica solo i giorni mancanti. Sync quotidiano -> velocissimo (oggi); rientro da
+un'assenza -> recupera in automatico i giorni di buco. Niente marcatore da mantenere:
+la sorgente di verita' e' il dato stesso nel DB; gli upsert sono idempotenti (ri-scaricare
+un giorno gia' salvato non crea doppioni). Cap a MAX_DAYS oltre il buffer del device (~7 gg).
+
 Uso:
-    python collect.py --mode quick     # batteria + HR + SpO2 + storico (~1 min)
-    python collect.py --mode full      # tutto, anche pressione e stress (~3 min)
-    python collect.py --mode history   # solo download storico (~10 s)
+    python collect.py --mode quick                   # batteria + HR + SpO2 + storico incrementale
+    python collect.py --mode full                    # tutto, anche pressione e stress
+    python collect.py --mode history                 # solo storico incrementale (dall'ultimo dato)
+    python collect.py --mode history --days 7        # override: forza 7 giorni a ritroso
+    python collect.py --mode history --from 2026-06-10T08:00   # parti da un istante preciso (ISO)
 """
 import argparse
 import asyncio
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
-from band import Band, RT, BPResult
+from band import Band, RT, BPResult, LOCAL_TZ
 from config import BAND_ADDRESS
 from store import Store
+
+DEFAULT_DAYS = 7   # ripiego quando il DB e' vuoto (primo sync)
+MAX_DAYS = 14      # tetto: oltre il buffer del device (~7 gg) insistere e' solo tempo perso
 
 
 def log(msg: str) -> None:
     print(f"[{datetime.now():%H:%M:%S}] {msg}", file=sys.stderr)
 
 
-async def run(address: str, mode: str, days: int) -> dict:
-    result = {"ok": False, "battery": None, "measurements": [],
+def resolve_days(store: Store, days_arg: int | None, from_arg: str | None) -> tuple[int, str]:
+    """Quanti giorni di storico scaricare (oltre a oggi) e perche'.
+    Precedenza: --days esplicito > --from esplicito > ultimo dato nel DB (incrementale)."""
+    if days_arg is not None:
+        return max(0, days_arg), f"override --days={days_arg}"
+    if from_arg:
+        try:
+            last = datetime.fromisoformat(from_arg)
+        except ValueError:
+            return DEFAULT_DAYS, f"--from non valido ({from_arg!r}), uso default {DEFAULT_DAYS}"
+        src = "--from"
+    else:
+        last = store.last_sample_ts()
+        src = "ultimo dato nel DB"
+    if last is None:
+        return DEFAULT_DAYS, f"DB vuoto, uso default {DEFAULT_DAYS}"
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    span = (datetime.now(LOCAL_TZ).date() - last.astimezone(LOCAL_TZ).date()).days
+    days = max(0, min(span, MAX_DAYS))
+    note = f"{src}: ultimo dato {last.astimezone(LOCAL_TZ):%Y-%m-%d %H:%M} -> {days} giorni"
+    if span > MAX_DAYS:
+        note += f" (limitato a {MAX_DAYS}, oltre il buffer del device)"
+    return days, note
+
+
+async def run(address: str, mode: str, days_arg: int | None, from_arg: str | None) -> dict:
+    result = {"ok": False, "battery": None, "measurements": [], "days_synced": None,
               "hr_points": 0, "step_points": 0, "stress_points": 0, "hrv_points": 0,
               "spo2_points": 0, "sleep_days": 0, "errors": []}
     store = Store()
+    days, why = resolve_days(store, days_arg, from_arg)
+    result["days_synced"] = days
+    log(f"Storico incrementale: {why}")
     try:
         async with Band(address) as band:
             log("Connesso al braccialetto.")
@@ -119,10 +159,15 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--address", default=BAND_ADDRESS)
     ap.add_argument("--mode", choices=["quick", "full", "history"], default="quick")
-    ap.add_argument("--days", type=int, default=1, help="giorni di storico da scaricare (oltre a oggi)")
+    ap.add_argument("--days", type=int, default=None,
+                    help="override: forza N giorni di storico a ritroso (oltre a oggi). "
+                         "Se assente, sincronizzazione incrementale dall'ultimo dato nel DB.")
+    ap.add_argument("--from", dest="from_ts", default=None,
+                    help="istante di partenza ISO (es. 2026-06-10T08:00): scarica da quel giorno "
+                         "a oggi. Ignorato se c'e' --days.")
     args = ap.parse_args()
 
-    result = asyncio.run(run(args.address, args.mode, args.days))
+    result = asyncio.run(run(args.address, args.mode, args.days, args.from_ts))
     print(json.dumps(result))  # ultima riga = JSON per la pagina
 
 

@@ -61,7 +61,7 @@ SCHEMA = [
         start_ts    DATETIME NOT NULL
     ) CHARACTER SET utf8mb4""",
     # Report dell'analisi AI (generati da index.php via OpenRouter):
-    # report_short = analisi veloce, report = analisi completa
+    # report_short = analisi veloce, report = analisi completa, report_diet = consigli alimentari
     """CREATE TABLE IF NOT EXISTS ai_report (
         id            BIGINT AUTO_INCREMENT PRIMARY KEY,
         ts            DATETIME NOT NULL,
@@ -70,6 +70,7 @@ SCHEMA = [
         prompt        MEDIUMTEXT,
         report_short  MEDIUMTEXT,
         report        MEDIUMTEXT,
+        report_diet   MEDIUMTEXT,
         tokens_in     INT,
         tokens_out    INT,
         INDEX (ts)
@@ -98,6 +99,20 @@ class Store:
 
     def _fmt(self, ts: datetime) -> str:
         return ts.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def last_sample_ts(self) -> datetime | None:
+        """Timestamp (UTC) del campione di storico piu' recente nel DB, o None se vuoto.
+        Usato per la sincronizzazione incrementale: si riparte da qui invece di scaricare
+        sempre N giorni fissi. Guarda le tabelle a campioni periodici (no measurements,
+        che sono solo misure on-demand)."""
+        tables = ("hr_samples", "step_samples", "stress_samples", "hrv_samples", "spo2_samples")
+        union = " UNION ALL ".join(f"SELECT MAX(ts) AS m FROM {t}" for t in tables)
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT MAX(m) FROM ({union}) x")
+            row = cur.fetchone()
+        if not row or row[0] is None:
+            return None
+        return row[0].replace(tzinfo=timezone.utc)   # salvato in UTC (naive da pymysql)
 
     def add_measurement(self, metric: str, value: float | None, value2: float | None = None,
                         unit: str | None = None, ts: datetime | None = None) -> None:
