@@ -72,6 +72,33 @@ function clean_ai_html(string $s): string {
     return trim($s);
 }
 
+/* Alcuni modelli (es. DeepSeek) inseriscono newline/tab/CR *letterali* dentro i valori
+ * stringa del JSON invece di escaparli (\n, \t, \r): lo standard li vieta e json_decode
+ * fallisce. Qui li ri-escapiamo, ma SOLO quando ci troviamo dentro una stringa, lasciando
+ * intatta la struttura. Sicuro su UTF-8: agiamo solo su byte di controllo ASCII. */
+function json_fix_ctrl(string $s): string {
+    $out = '';
+    $in = false;   // siamo dentro una stringa JSON?
+    $esc = false;  // il carattere precedente era un backslash di escape?
+    $n = strlen($s);
+    for ($i = 0; $i < $n; $i++) {
+        $ch = $s[$i];
+        if ($in) {
+            if ($esc)            { $out .= $ch; $esc = false; continue; }
+            if ($ch === '\\')    { $out .= $ch; $esc = true;  continue; }
+            if ($ch === '"')     { $out .= $ch; $in = false;  continue; }
+            if ($ch === "\n")    { $out .= '\\n'; continue; }
+            if ($ch === "\r")    { $out .= '\\r'; continue; }
+            if ($ch === "\t")    { $out .= '\\t'; continue; }
+            $out .= $ch;
+        } else {
+            if ($ch === '"') $in = true;
+            $out .= $ch;
+        }
+    }
+    return $out;
+}
+
 function openrouter_chat(string $prompt, bool $json = false): array {
     if (OPENROUTER_API_KEY === '') {
         throw new RuntimeException('OPENROUTER_API_KEY mancante: aggiungila al file .env');
@@ -268,6 +295,9 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $content = preg_replace('/^```[a-zA-Z]*\s*/', '', trim($ai['content']));
         $content = preg_replace('/\s*```$/', '', $content);
         $parsed = json_decode($content, true);
+        if (!is_array($parsed)) {                          // secondo tentativo: ri-escapa i caratteri di controllo letterali
+            $parsed = json_decode(json_fix_ctrl($content), true);
+        }
         if (is_array($parsed) && isset($parsed['analisi_veloce'], $parsed['analisi_completa'])) {
             $short = clean_ai_html((string)$parsed['analisi_veloce']);
             $full  = clean_ai_html((string)$parsed['analisi_completa']);
