@@ -405,7 +405,7 @@ function tlocal($ts) {
 /* ---------- Lettura dati per la dashboard ---------- */
 $err = null;
 $latest = []; $hr = []; $steps = []; $recent = []; $stressHist = []; $hrv = []; $allrows = [];
-$spo2hist = []; $sleepSegs = []; $sleepDate = null; $sleepStart = null;
+$spo2hist = []; $sleepSegs = []; $sleepDate = null; $sleepStart = null; $sleepDays = [];
 $latestStress = false; $latestHrv = false; $latestSpo2 = false;
 $series = ['spo2' => [], 'blood_pressure' => []];
 try {
@@ -433,6 +433,22 @@ try {
         $ss = $pdo->prepare("SELECT start_ts FROM sleep_sessions WHERE sleep_date=?");
         $ss->execute([$sleepDate]);
         $sleepStart = $ss->fetchColumn() ?: null;
+    }
+    // sonno: tutte le notti del periodo selezionato, per la verifica giorno-per-giorno.
+    // sleep_date e' una data locale; mappo i bordi UTC del range a date locali.
+    $sleepFrom = (new DateTime($start, $UTC))->setTimezone($TZL)->format('Y-m-d');
+    $sleepTo   = (new DateTime($end ?: 'now', $end ? $UTC : $TZL))->setTimezone($TZL)->format('Y-m-d');
+    $sleepDays = [];
+    $st = $pdo->prepare("SELECT s.sleep_date d, s.idx, s.stage, s.minutes, ss.start_ts
+                         FROM sleep_segments s
+                         LEFT JOIN sleep_sessions ss ON ss.sleep_date = s.sleep_date
+                         WHERE s.sleep_date BETWEEN ? AND ?
+                         ORDER BY s.sleep_date, s.idx");
+    $st->execute([$sleepFrom, $sleepTo]);
+    foreach ($st as $r) {
+        $d = $r['d'];
+        if (!isset($sleepDays[$d])) $sleepDays[$d] = ['date' => $d, 'start' => $r['start_ts'], 'segs' => []];
+        $sleepDays[$d]['segs'][] = ['idx' => $r['idx'], 'stage' => $r['stage'], 'minutes' => $r['minutes']];
     }
     foreach (array_keys($series) as $metric) {
         $st = $pdo->prepare("SELECT ts, value, value2 FROM measurements
@@ -483,6 +499,46 @@ function sleep_totals(array $segs): array {
     return $t;
 }
 function hhmm(int $min): string { return intdiv($min, 60) . 'h ' . str_pad($min % 60, 2, '0', STR_PAD_LEFT) . 'm'; }
+
+// Corpo del pannello sonno (totali + ipnogramma + asse orario + statistiche) per UNA notte.
+function sleep_panel_body(array $segs, ?string $startTs, DateTimeZone $TZL): string {
+    $tot = sleep_totals($segs);
+    $axisStart = $axisEnd = null; $ticks = [];
+    if ($startTs && $tot['total']) {
+        $axisStart = new DateTime($startTs, new DateTimeZone('UTC')); $axisStart->setTimezone($TZL);
+        $axisEnd = (clone $axisStart)->modify("+{$tot['total']} minutes");
+        $s0 = (int)$axisStart->format('U'); $s1 = (int)$axisEnd->format('U'); $span = max(1, $s1 - $s0);
+        for ($t = (int)(ceil($s0 / 3600) * 3600); $t < $s1; $t += 3600) {
+            $td = (new DateTime("@$t"))->setTimezone($TZL);
+            $ticks[] = [round(($t - $s0) / $span * 100, 3), $td->format('H:i')];
+        }
+    }
+    ob_start(); ?>
+    <div><span style="font-size:28px;font-weight:600"><?= hhmm($tot['total']) ?></span>
+      <?php if ($axisStart): ?><span class="sleeprange"><?= $axisStart->format('H:i') ?> &rarr; <?= $axisEnd->format('H:i') ?></span><?php endif; ?>
+    </div>
+    <div class="hypno">
+      <?php foreach ($segs as $s): $w = $tot['total'] ? round($s['minutes'] * 100 / $tot['total'], 3) : 0; ?>
+        <div class="seg seg-<?= htmlspecialchars($s['stage']) ?>" style="width:<?= $w ?>%"
+             title="<?= htmlspecialchars($s['stage']) ?> &middot; <?= (int)$s['minutes'] ?> min"></div>
+      <?php endforeach; ?>
+    </div>
+    <?php if ($ticks): ?>
+    <div class="hypnoaxis">
+      <?php foreach ($ticks as [$pos, $lbl]): ?>
+        <span class="tick" style="left:<?= $pos ?>%"><?= htmlspecialchars($lbl) ?></span>
+      <?php endforeach; ?>
+    </div>
+    <?php endif; ?>
+    <div class="sleepstats">
+      <span><span class="dot" style="background:#5a9bff"></span>Leggero <b><?= hhmm($tot['light']) ?></b></span>
+      <span><span class="dot" style="background:#2b3f86"></span>Profondo <b><?= hhmm($tot['deep']) ?></b></span>
+      <span><span class="dot" style="background:#b07bff"></span>REM <b><?= hhmm($tot['rem']) ?></b></span>
+      <span><span class="dot" style="background:#f5b73b"></span>Sveglio <b><?= hhmm($tot['awake']) ?></b></span>
+    </div>
+    <?php
+    return ob_get_clean();
+}
 
 // valore formattato per la tabella unica
 function row_value($r) {
@@ -560,6 +616,12 @@ function row_value($r) {
   .hypnoaxis .tick { position:absolute; top:0; transform:translateX(-50%); color:var(--mut); font-size:12px; white-space:nowrap; }
   .hypnoaxis .tick::before { content:''; display:block; width:1px; height:6px; background:#3a4654; margin:0 auto 2px; }
   .sleeprange { color:var(--mut); font-size:15px; font-weight:600; margin-left:10px; }
+  .sleepday { padding:14px 0; border-top:1px solid #232c36; }
+  .sleepday:first-of-type { border-top:0; }
+  .sleepday h3 { margin:0 0 4px; font-size:16px; font-weight:600; }
+  .sleepday.bad { background:#2a1a1d; border-radius:10px; padding:14px; margin:6px 0; border-top:0; }
+  .flag { display:inline-block; margin-left:10px; font-size:12px; font-weight:600; color:#ffb4bd;
+          background:#3a1f24; padding:2px 8px; border-radius:999px; }
 </style>
 </head>
 <body>
@@ -661,47 +723,38 @@ function row_value($r) {
   </div>
 </div>
 
-<?php $stot = sleep_totals($sleepSegs); ?>
 <div class="panel">
   <h2>Sonno<?= $sleepDate ? ' · ' . htmlspecialchars(date('d/m/Y', strtotime($sleepDate))) : '' ?></h2>
-  <?php if ($sleepSegs):
-      $axisStart = $axisEnd = null; $ticks = [];
-      if ($sleepStart && $stot['total']) {
-          $axisStart = new DateTime($sleepStart, new DateTimeZone('UTC')); $axisStart->setTimezone($TZL);
-          $axisEnd = (clone $axisStart)->modify("+{$stot['total']} minutes");
-          $s0 = (int)$axisStart->format('U'); $s1 = (int)$axisEnd->format('U'); $span = max(1, $s1 - $s0);
-          for ($t = (int)(ceil($s0 / 3600) * 3600); $t < $s1; $t += 3600) {
-              $td = (new DateTime("@$t"))->setTimezone($TZL);
-              $ticks[] = [round(($t - $s0) / $span * 100, 3), $td->format('H:i')];
-          }
-      }
-  ?>
-    <div><span style="font-size:28px;font-weight:600"><?= hhmm($stot['total']) ?></span>
-      <?php if ($axisStart): ?><span class="sleeprange"><?= $axisStart->format('H:i') ?> → <?= $axisEnd->format('H:i') ?></span><?php endif; ?>
-    </div>
-    <div class="hypno">
-      <?php foreach ($sleepSegs as $s): $w = $stot['total'] ? round($s['minutes'] * 100 / $stot['total'], 3) : 0; ?>
-        <div class="seg seg-<?= htmlspecialchars($s['stage']) ?>" style="width:<?= $w ?>%"
-             title="<?= htmlspecialchars($s['stage']) ?> · <?= (int)$s['minutes'] ?> min"></div>
-      <?php endforeach; ?>
-    </div>
-    <?php if ($ticks): ?>
-    <div class="hypnoaxis">
-      <?php foreach ($ticks as [$pos, $lbl]): ?>
-        <span class="tick" style="left:<?= $pos ?>%"><?= htmlspecialchars($lbl) ?></span>
-      <?php endforeach; ?>
-    </div>
-    <?php endif; ?>
-    <div class="sleepstats">
-      <span><span class="dot" style="background:#5a9bff"></span>Leggero <b><?= hhmm($stot['light']) ?></b></span>
-      <span><span class="dot" style="background:#2b3f86"></span>Profondo <b><?= hhmm($stot['deep']) ?></b></span>
-      <span><span class="dot" style="background:#b07bff"></span>REM <b><?= hhmm($stot['rem']) ?></b></span>
-      <span><span class="dot" style="background:#f5b73b"></span>Sveglio <b><?= hhmm($stot['awake']) ?></b></span>
-    </div>
+  <?php if ($sleepSegs): ?>
+    <?= sleep_panel_body($sleepSegs, $sleepStart, $TZL) ?>
   <?php else: ?>
     <div class="hint">Nessun dato di sonno ancora. Indossa il braccialetto di notte, poi premi "Solo storico".</div>
   <?php endif; ?>
 </div>
+
+<?php if ($sleepDays): ?>
+<div class="panel">
+  <h2>Sonno · verifica giorno per giorno <span class="sleeprange"><?= count($sleepDays) ?> notti nel periodo</span></h2>
+  <p class="hint">Controllo visivo dei dati passati all'analisi AI. Una notte oltre ~16h, o identica a quella precedente, è quasi certamente un errore di lettura del braccialetto (non un sonno reale).</p>
+  <?php $prevSig = null;
+    foreach ($sleepDays as $day):
+        $tot = sleep_totals($day['segs']);
+        $sig = md5(json_encode($day['segs']));
+        $dupOfPrev = ($sig === $prevSig);
+        $tooLong = $tot['total'] > 16 * 60;
+        $prevSig = $sig;
+  ?>
+    <div class="sleepday<?= ($tooLong || $dupOfPrev) ? ' bad' : '' ?>">
+      <h3><?= htmlspecialchars(date('d/m/Y', strtotime($day['date']))) ?>
+        <span class="hint" style="font-weight:400"><?= count($day['segs']) ?> segmenti</span>
+        <?php if ($tooLong): ?><span class="flag">⚠ <?= round($tot['total'] / 60, 1) ?>h · impossibile</span><?php endif; ?>
+        <?php if ($dupOfPrev): ?><span class="flag">⧉ identico al giorno prima</span><?php endif; ?>
+      </h3>
+      <?= sleep_panel_body($day['segs'], $day['start'], $TZL) ?>
+    </div>
+  <?php endforeach; ?>
+</div>
+<?php endif; ?>
 
 <div class="panel">
   <h2>Misure recenti</h2>

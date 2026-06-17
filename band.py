@@ -465,35 +465,62 @@ class Band:
                 out.append((base + timedelta(hours=h), hi))
         return out
 
-    async def sleep_detail(self, day: int = 0) -> "SleepDetail | None":
-        """Fasi del sonno del giorno: coppie (fase, durata_min). Fasi 2=leggero,3=profondo,4=REM,5=sveglio.
+    def _parse_sleep_blob(self, body: bytes) -> list["SleepDetail"]:
+        """Decodifica il blob del sonno. Verificato byte-per-byte sull'app ufficiale.
 
-        Body: header di 7 byte (01 00 + start ecc.) seguito da coppie (fase, durata).
-        Verificato byte-per-byte sull'app ufficiale: totali esatti (leggero/profondo/REM/sveglio)
-        e nessun byte di avanzo. NB: prima leggevamo (durata, fase) con header a 6 byte -> sbagliato.
+        Il device NON restituisce una notte per richiesta: impacchetta TUTTE le notti
+        memorizzate in un unico blob (per day>=1 ignora il parametro e ridà sempre tutto;
+        per day=0 ridà solo la notte piu' recente, ma nello stesso formato). Struttura:
+
+            body[0] = N (numero di notti)
+            poi N record:  [idx][?][start_u16 LE][end_u16 LE]  +  coppie (fase, durata)
+            - idx conta a ritroso: 0 = notte piu' recente -> oggi, k -> oggi-k
+            - start/end = minuti dalla mezzanotte; durata notte = (end - start) mod 1440
+            - le coppie (fase 2=leggero/3=profondo/4=REM/5=sveglio, durata_min) sommano
+              esattamente alla durata: e' questo che delimita un record dal successivo.
         """
+        out: list[SleepDetail] = []
+        if not body or len(body) < 8:
+            return out
+        n = body[0]
+        i = 1
+        for _ in range(n):
+            if i + 6 > len(body):
+                break
+            idx = body[i]
+            start_min = body[i + 2] | body[i + 3] << 8
+            end_min = body[i + 4] | body[i + 5] << 8
+            dur = (end_min - start_min) % 1440
+            i += 6
+            segs: list[SleepSegment] = []
+            acc = 0
+            while i + 2 <= len(body) and acc < dur:
+                stage, du = body[i], body[i + 1]
+                if stage not in SLEEP_STAGES:
+                    break
+                if du:
+                    segs.append(SleepSegment(SLEEP_STAGES[stage], du))
+                acc += du
+                i += 2
+            if not segs:
+                continue
+            base = datetime.fromtimestamp(midnight_ts(idx), LOCAL_TZ)
+            out.append(SleepDetail(date=base, header=b"", segments=segs,
+                                   start=base + timedelta(minutes=start_min)))
+        return out
+
+    async def sleep_nights(self) -> list["SleepDetail"]:
+        """Tutte le notti memorizzate nel braccialetto, da UNA sola richiesta bc 0x27
+        (il device le impacchetta tutte in un blob; vedi _parse_sleep_blob)."""
         if not await self._bc_login():
-            return None
-        body = await self._bc_request(BC_SLEEP, bytes([(-day) & 0xFF, 0x01]))
-        if not body or len(body) < 9:
-            return None
-        header, pairs = body[:7], body[7:]  # header 7B; poi coppie (fase, durata)
-        segs: list[SleepSegment] = []
-        for i in range(0, len(pairs) - 1, 2):
-            stage, dur = pairs[i], pairs[i + 1]
-            if dur and stage in SLEEP_STAGES:
-                segs.append(SleepSegment(SLEEP_STAGES[stage], dur))
-        if not segs:
-            return None
-        base = datetime.fromtimestamp(midnight_ts(day), LOCAL_TZ)
-        # Inizio sonno: minuti dalla mezzanotte, u16 LE su header[3:5].
-        # (header 01 00 2c 29 00 24 02 -> 0x0029 = 41 -> 00:41, combacia con l'app.)
-        # DA CONFERMARE su una notte con addormentamento prima di mezzanotte.
-        try:
-            start = base + timedelta(minutes=struct.unpack_from("<H", header, 3)[0])
-        except Exception:
-            start = None
-        return SleepDetail(date=base, header=header, segments=segs, start=start)
+            return []
+        body = await self._bc_request(BC_SLEEP, bytes([0xff, 0x01]))  # day>=1 -> blob completo
+        return self._parse_sleep_blob(body or b"")
+
+    async def sleep_detail(self, day: int = 0) -> "SleepDetail | None":
+        """Singola notte all'offset `day` (0=oggi, 1=ieri...). Usa il parser del blob."""
+        want = datetime.fromtimestamp(midnight_ts(day), LOCAL_TZ).date()
+        return next((s for s in await self.sleep_nights() if s.date.date() == want), None)
 
     async def steps_history(self, day: int = 0) -> list[tuple[datetime, int, int, int]]:
         """Ritorna (timestamp, passi, calorie, distanza_m) per slot da 15 minuti."""

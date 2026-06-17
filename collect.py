@@ -123,21 +123,28 @@ async def run(address: str, mode: str, days_arg: int | None, from_arg: str | Non
                         result["stress_points"] += store.upsert_stress(stress)
                         hrv = await band.hrv_history(d)
                         result["hrv_points"] += store.upsert_hrv(hrv)
-                        # canale ricco bc: SpO2 storica + fasi del sonno
+                        # canale ricco bc: SpO2 storica (le fasi del sonno arrivano in un blob unico)
                         spo2 = await band.spo2_history(d)
                         result["spo2_points"] += store.upsert_spo2(spo2)
-                        sleep = await band.sleep_detail(d)
-                        n_sleep = 0
-                        if sleep:
-                            store.replace_sleep(sleep.date.strftime("%Y-%m-%d"),
-                                                [(s.stage, s.minutes) for s in sleep.segments],
-                                                start_ts=sleep.start)
-                            result["sleep_days"] += 1
-                            n_sleep = len(sleep.segments)
                         log(f"Giorno -{d}: {len(hr)} punti battito, {len(st)} slot passi, "
-                            f"{len(stress)} stress, {len(hrv)} HRV, {len(spo2)} SpO2, {n_sleep} segmenti sonno")
+                            f"{len(stress)} stress, {len(hrv)} HRV, {len(spo2)} SpO2")
                     except Exception as e:
                         result["errors"].append(f"storico giorno -{d}: {e}")
+
+                # Sonno: il device impacchetta TUTTE le notti memorizzate in un unico blob,
+                # quindi una sola richiesta (vedi Band.sleep_nights). Niente loop per-giorno:
+                # iterare gli offset ridava sempre lo stesso blob, sommato come una notte sola.
+                try:
+                    nights = await band.sleep_nights()
+                    for night in nights:
+                        store.replace_sleep(night.date.strftime("%Y-%m-%d"),
+                                            [(s.stage, s.minutes) for s in night.segments],
+                                            start_ts=night.start)
+                    result["sleep_days"] = len(nights)
+                    log("Sonno: " + (", ".join(f"{n.date:%m-%d}={n.totals()['total']}m" for n in nights)
+                                      or "nessuna notte"))
+                except Exception as e:
+                    result["errors"].append(f"sonno: {e}")
 
             # fallback: se il battito on-demand non ha agganciato, usa l'ultimo dal log 24/7
             if not measured_hr and last_hr_point is not None:
