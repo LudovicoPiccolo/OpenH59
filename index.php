@@ -165,18 +165,19 @@ if (($_GET['action'] ?? '') === 'sync') {
     exit;
 }
 
-/* ---------- Endpoint AJAX: genera il prompt per l'analisi AI (ultimi 365 giorni) ----------
- * Aggrega i dati di salute dell'ultimo anno in un riepilogo giornaliero e costruisce
- * un prompt in italiano per un modello AI. Per ora lo salva solo in prompt.txt; in
- * futuro questo prompt verrà inviato a OpenRouter. */
+/* ---------- Endpoint AJAX: analisi AI dei trend sanitari (ultimi 6 mesi) ----------
+ * Aggrega i dati di salute degli ultimi 6 mesi e costruisce un prompt in italiano
+ * a due livelli — dettaglio completo sugli ultimi 7 giorni + recap giornaliero
+ * sintetico sui mesi precedenti — lo invia a OpenRouter e salva report e prompt
+ * nella tabella ai_report. Una copia del prompt resta in prompt.txt per debug. */
 if (($_GET['action'] ?? '') === 'ai_prompt') {
     set_time_limit(0);                 // la risposta del modello puo' richiedere diversi secondi
     ignore_user_abort(true);
     header('Content-Type: application/json');
     try {
         $pdo = db();
-        $startUtc  = (new DateTime('now', new DateTimeZone('UTC')))->modify('-365 day')->format('Y-m-d H:i:s');
-        $startDate = (new DateTime('now', new DateTimeZone('Europe/Rome')))->modify('-365 day')->format('Y-m-d');
+        $startUtc  = (new DateTime('now', new DateTimeZone('UTC')))->modify('-6 month')->format('Y-m-d H:i:s');
+        $startDate = (new DateTime('now', new DateTimeZone('Europe/Rome')))->modify('-6 month')->format('Y-m-d');
 
         // Raggruppamento per giorno locale (Europe/Rome) se le tabelle del fuso orario sono
         // caricate in MySQL, altrimenti ripiego sul giorno UTC.
@@ -233,7 +234,7 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
 
         // ----- Costruzione del prompt -----
         $P  = "SEI UN MEDICO E ANALISTA DI DATI SANITARI.\n\n";
-        $P .= "Analizza i dati di salute raccolti da un braccialetto fitness (modello H59) relativi a un singolo utente nell'ultimo anno. Valuta i dati esclusivamente dal punto di vista sanitario.\n\n";
+        $P .= "Analizza i dati di salute raccolti da un braccialetto fitness (modello H59) relativi a un singolo utente negli ultimi 6 mesi. Valuta i dati esclusivamente dal punto di vista sanitario.\n\n";
         $P .= "== ISTRUZIONI ==\n";
         $P .= "1. Riassumi lo stato di salute generale che emerge dai dati.\n";
         $P .= "2. Individua le tendenze nel tempo (miglioramenti o peggioramenti) per ciascuna metrica.\n";
@@ -271,9 +272,18 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $P .= "Pressione: media {$avg($col('bp','sys'))}/{$avg($col('bp','dia'))} mmHg.\n";
         $sleepAvgMin = $sleepTotals ? array_sum($sleepTotals) / count($sleepTotals) : null;
         $P .= "Sonno: media " . ($sleepAvgMin !== null ? round($sleepAvgMin / 60, 1) . "h" : "—") . " a notte (" . count($sleepTotals) . " notti registrate).\n\n";
-        $P .= "== DATI GIORNALIERI (CSV) ==\n";
+        // Dati giornalieri su DUE livelli: dettaglio completo sugli ultimi 7 giorni
+        // (per consigli azionabili) e recap sintetico sui mesi precedenti (per i trend).
+        // I 7 giorni recenti sono ESCLUSI dal recap per non duplicare gli stessi giorni.
+        $cut7   = (new DateTime('now', new DateTimeZone('Europe/Rome')))->modify('-7 day')->format('Y-m-d');
+        $recent = array_filter($days, fn($d) => $d >  $cut7, ARRAY_FILTER_USE_KEY);
+        $older  = array_filter($days, fn($d) => $d <= $cut7, ARRAY_FILTER_USE_KEY);
+
+        $P .= "I dati giornalieri sono su DUE livelli: gli ULTIMI 7 GIORNI in dettaglio completo (usali per i consigli azionabili) e i MESI PRECEDENTI come recap sintetico (usalo per i trend di lungo periodo). I 7 giorni recenti NON sono ripetuti nel recap.\n\n";
+
+        $P .= "== ULTIMI 7 GIORNI (dettaglio, CSV) ==\n";
         $P .= "data,hr_med,hr_min,hr_max,spo2_med,spo2_min,stress_med,stress_max,hrv_med,passi,kcal,dist_m,sonno_tot_min,sonno_leggero,sonno_profondo,sonno_rem,sonno_sveglio,pa_sist,pa_diast\n";
-        foreach ($days as $d => $row) {
+        foreach ($recent as $d => $row) {
             $sl = $row['sleep'] ?? null;
             $P .= implode(',', [
                 $d,
@@ -286,6 +296,23 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
                 $g($row,'bp','sys'), $g($row,'bp','dia'),
             ]) . "\n";
         }
+        if (!$recent) $P .= "(nessun dato negli ultimi 7 giorni)\n";
+
+        $P .= "\n== MESI PRECEDENTI (recap giornaliero, CSV) ==\n";
+        $P .= "data,hr_med,hr_min,hr_max,spo2_med,spo2_min,stress_med,hrv_med,passi,sonno_tot_min\n";
+        foreach ($older as $d => $row) {
+            $sl = $row['sleep'] ?? null;
+            $P .= implode(',', [
+                $d,
+                $g($row,'hr','a'), $g($row,'hr','mn'), $g($row,'hr','mx'),
+                $g($row,'spo2','a'), $g($row,'spo2','mn'),
+                $g($row,'stress','a'),
+                $g($row,'hrv','a'),
+                $g($row,'steps','steps'),
+                $sl ? $sl['total'] : '',
+            ]) . "\n";
+        }
+        if (!$older) $P .= "(nessun dato nei mesi precedenti)\n";
         $P .= "== FINE DATI ==\n\nProcedi ora con l'analisi sanitaria seguendo le istruzioni qui sopra.\n";
 
         @file_put_contents(__DIR__ . '/prompt.txt', $P);   // copia di debug del prompt inviato

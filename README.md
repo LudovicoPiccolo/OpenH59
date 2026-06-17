@@ -29,7 +29,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 ## Cosa si ottiene
 - **Storico** (si riempie indossando il braccialetto): battito (5 min), passi/calorie/distanza (15 min), stress (30 min), HRV (30 min), **SpO2 (oraria, min-max)** e **sonno a fasi** (leggero/profondo/REM/sveglio).
 - **On-demand** (misura del momento): battito, SpO2, pressione (sis/dia), stress.
-- **Analisi AI** (opzionale): invii il riepilogo dell'ultimo anno (365 giorni) a un modello via **OpenRouter** e ottieni un report sanitario sui tuoi trend. Funziona in due livelli — un riepilogo veloce e un'analisi completa — salvati nella tabella `ai_report`.
+- **Analisi AI** (opzionale): invii un riepilogo degli ultimi 6 mesi — dettaglio completo sugli ultimi 7 giorni più recap giornaliero sui mesi precedenti — a un modello via **OpenRouter** e ottieni un report sanitario sui tuoi trend (riepilogo veloce, analisi completa e consigli alimentari), salvato nella tabella `ai_report`.
 
 ## Requisiti
 - **macOS** (il client BLE usa CoreBluetooth tramite `bleak`).
@@ -77,7 +77,7 @@ Raccoglie e visualizza i dati del braccialetto **H59** (battito, SpO2, pressione
 1. **Indossa il braccialetto** e **spegni il Bluetooth del telefono** (il braccialetto parla con un solo dispositivo per volta).
 2. Avvia la dashboard (`bash start.command`) e apri http://127.0.0.1:8080.
 3. Premi **Misura veloce** (~2-3 min) / **Misura completa** (~4-5 min, con pressione e stress) / **Solo storico** (~2 min).
-4. (Opzionale) Premi **Analisi AI** per inviare il riepilogo dell'ultimo anno a OpenRouter e ricevere il report sui tuoi trend.
+4. (Opzionale) Premi **Analisi AI** per inviare il riepilogo degli ultimi 6 mesi a OpenRouter e ricevere il report sui tuoi trend.
 
 > **Sincronizzazione incrementale:** ogni sync riparte dall'ultimo dato salvato nel database e scarica solo i giorni mancanti. Sync quotidiano → istantaneo; se stai via qualche giorno col braccialetto al polso, al rientro un solo sync recupera in automatico tutto il buffer (il device tiene i dati ~7 giorni; ri-scaricarli non crea doppioni). Override manuali: `collect.py --days 7` o `collect.py --from 2026-06-10T08:00`.
 
@@ -117,7 +117,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 ## What you get
 - **History** (fills up while wearing the band): heart rate (5 min), steps/calories/distance (15 min), stress (30 min), HRV (30 min), **SpO2 (hourly, min-max)** and **staged sleep** (light/deep/REM/awake).
 - **On-demand** (instant measurement): heart rate, SpO2, blood pressure (sys/dia), stress.
-- **AI analysis** (optional): send the last year's summary (365 days) to a model via **OpenRouter** and get a health report on your trends. It runs in two tiers — a quick summary and a full analysis — both saved in the `ai_report` table.
+- **AI analysis** (optional): send a 6-month summary — the last 7 days in full detail plus a daily recap of the prior months — to a model via **OpenRouter** and get a health report on your trends (quick summary, full analysis and dietary advice), saved in the `ai_report` table.
 
 ## Requirements
 - **macOS** (the BLE client uses CoreBluetooth via `bleak`).
@@ -165,7 +165,7 @@ Collect and visualize data from the **H59** fitness band — heart rate, SpO2, b
 1. **Wear the band** and **turn off your phone's Bluetooth** (the band talks to one device at a time).
 2. Start the dashboard (`bash start.command`) and open http://127.0.0.1:8080.
 3. Press **Quick measure** (~2-3 min) / **Full measure** (~4-5 min, with blood pressure and stress) / **History only** (~2 min).
-4. (Optional) Press **AI analysis** to send the last year's summary to OpenRouter and get a report on your trends.
+4. (Optional) Press **AI analysis** to send the last 6 months' summary to OpenRouter and get a report on your trends.
 
 > **Incremental sync:** each sync resumes from the last data point in the database and downloads only the missing days. Daily sync → instant; if you're away for a few days while still wearing the band, a single sync on your return automatically recovers the whole buffer (the device holds ~7 days; re-downloading creates no duplicates). Manual overrides: `collect.py --days 7` or `collect.py --from 2026-06-10T08:00`.
 
