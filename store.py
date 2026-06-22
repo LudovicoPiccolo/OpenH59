@@ -60,6 +60,13 @@ SCHEMA = [
         sleep_date  DATE NOT NULL PRIMARY KEY,
         start_ts    DATETIME NOT NULL
     ) CHARACTER SET utf8mb4""",
+    # Note personali dell'utente su un singolo giorno (es. "pomeriggio corsa 10km",
+    # "ferie al mare"): contesto qualitativo passato all'analisi AI. Una per giorno locale.
+    """CREATE TABLE IF NOT EXISTS day_notes (
+        note_date   DATE NOT NULL PRIMARY KEY,
+        note        TEXT,
+        updated_at  DATETIME NOT NULL
+    ) CHARACTER SET utf8mb4""",
     # Report dell'analisi AI (generati da index.php via OpenRouter):
     # report_short = analisi veloce, report = analisi completa, report_diet = consigli alimentari
     """CREATE TABLE IF NOT EXISTS ai_report (

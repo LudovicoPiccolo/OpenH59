@@ -60,6 +60,15 @@ function ensure_ai_report(PDO $pdo): void {
     }
 }
 
+/* Tabella delle note personali per-giorno (creata pigra: funziona anche senza collect.py). */
+function ensure_day_notes(PDO $pdo): void {
+    $pdo->exec("CREATE TABLE IF NOT EXISTS day_notes (
+        note_date   DATE NOT NULL PRIMARY KEY,
+        note        TEXT,
+        updated_at  DATETIME NOT NULL
+    ) CHARACTER SET utf8mb4");
+}
+
 /* Ripulisce l'HTML prodotto dal modello prima di salvarlo/mostrarlo:
  * toglie eventuali fence Markdown, il wrapper di documento e i tag/attributi non sicuri. */
 function clean_ai_html(string $s): string {
@@ -165,6 +174,36 @@ if (($_GET['action'] ?? '') === 'sync') {
     exit;
 }
 
+/* ---------- Endpoint AJAX: salva/aggiorna la nota personale di un giorno ----------
+ * Riceve `date` (YYYY-MM-DD) e `note`. Nota vuota = cancella la nota del giorno.
+ * Le note sono contesto qualitativo che viene poi incluso nel prompt dell'analisi AI. */
+if (($_GET['action'] ?? '') === 'save_note') {
+    header('Content-Type: application/json');
+    try {
+        $date = (string)($_POST['date'] ?? '');
+        $d = DateTime::createFromFormat('Y-m-d', $date);
+        if (!$d || $d->format('Y-m-d') !== $date) {
+            throw new RuntimeException('Data non valida');
+        }
+        $note = trim((string)($_POST['note'] ?? ''));
+        if (function_exists('mb_substr')) $note = mb_substr($note, 0, 2000);  // cap: non gonfiare il prompt
+        $pdo = db();
+        ensure_day_notes($pdo);
+        if ($note === '') {
+            $pdo->prepare("DELETE FROM day_notes WHERE note_date=?")->execute([$date]);
+        } else {
+            $now = (new DateTime('now', new DateTimeZone('UTC')))->format('Y-m-d H:i:s');
+            $st = $pdo->prepare("INSERT INTO day_notes (note_date, note, updated_at) VALUES (?,?,?)
+                                 ON DUPLICATE KEY UPDATE note=VALUES(note), updated_at=VALUES(updated_at)");
+            $st->execute([$date, $note, $now]);
+        }
+        echo json_encode(['ok' => true, 'date' => $date, 'has' => $note !== '', 'note' => $note]);
+    } catch (Throwable $e) {
+        echo json_encode(['ok' => false, 'errors' => [$e->getMessage()]]);
+    }
+    exit;
+}
+
 /* ---------- Endpoint AJAX: analisi AI dei trend sanitari (ultimi 6 mesi) ----------
  * Aggrega i dati di salute degli ultimi 6 mesi e costruisce un prompt in italiano
  * a due livelli — dettaglio completo sugli ultimi 7 giorni + recap giornaliero
@@ -195,9 +234,31 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
             return $st;
         };
 
-        foreach ($agg("SELECT $LD d, ROUND(AVG(bpm)) a, MIN(bpm) mn, MAX(bpm) mx FROM hr_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'hr', $r);
-        foreach ($agg("SELECT $LD d, ROUND(AVG(spo2),1) a, MIN(spo2) mn FROM spo2_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'spo2', $r);
-        foreach ($agg("SELECT $LD d, ROUND(AVG(score)) a, MAX(score) mx FROM stress_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'stress', $r);
+        // Battito: min/max giornalieri robusti al 5°/95° percentile, così un singolo
+        // glitch del sensore (es. un campione isolato a 40 bpm) non definisce gli estremi
+        // del giorno. Sotto i 12 campioni il giorno è poco affidabile → MIN/MAX grezzi.
+        foreach ($agg(
+            "SELECT d, ROUND(AVG(bpm)) a,
+                    ROUND(CASE WHEN COUNT(*) >= 12 THEN MIN(CASE WHEN pr >= 0.05 THEN bpm END) ELSE MIN(bpm) END) mn,
+                    ROUND(CASE WHEN COUNT(*) >= 12 THEN MAX(CASE WHEN pr <= 0.95 THEN bpm END) ELSE MAX(bpm) END) mx
+               FROM (SELECT $LD d, bpm, PERCENT_RANK() OVER (PARTITION BY $LD ORDER BY bpm) pr
+                       FROM hr_samples WHERE ts >= ?) s
+              GROUP BY d") as $r) $put($r['d'], 'hr', $r);
+        // SpO2: conta il minimo (valore d'allarme), ma robusto al 5° percentile per
+        // scartare i singoli cali dovuti a scarso contatto del sensore.
+        foreach ($agg(
+            "SELECT d, ROUND(AVG(spo2),1) a,
+                    ROUND(CASE WHEN COUNT(*) >= 12 THEN MIN(CASE WHEN pr >= 0.05 THEN spo2 END) ELSE MIN(spo2) END) mn
+               FROM (SELECT $LD d, spo2, PERCENT_RANK() OVER (PARTITION BY $LD ORDER BY spo2) pr
+                       FROM spo2_samples WHERE ts >= ?) s
+              GROUP BY d") as $r) $put($r['d'], 'spo2', $r);
+        // Stress: conta il picco, robusto al 95° percentile per scartare i singoli picchi spuri.
+        foreach ($agg(
+            "SELECT d, ROUND(AVG(score)) a,
+                    ROUND(CASE WHEN COUNT(*) >= 12 THEN MAX(CASE WHEN pr <= 0.95 THEN score END) ELSE MAX(score) END) mx
+               FROM (SELECT $LD d, score, PERCENT_RANK() OVER (PARTITION BY $LD ORDER BY score) pr
+                       FROM stress_samples WHERE ts >= ?) s
+              GROUP BY d") as $r) $put($r['d'], 'stress', $r);
         foreach ($agg("SELECT $LD d, ROUND(AVG(ms)) a FROM hrv_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'hrv', $r);
         foreach ($agg("SELECT $LD d, SUM(steps) steps, SUM(calories) cal, SUM(distance) dist FROM step_samples WHERE ts >= ? GROUP BY d") as $r) $put($r['d'], 'steps', $r);
         foreach ($agg("SELECT $LD d, ROUND(AVG(value)) sys, ROUND(AVG(value2)) dia FROM measurements WHERE metric='blood_pressure' AND ts >= ? GROUP BY d") as $r) $put($r['d'], 'bp', $r);
@@ -212,6 +273,16 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
             $days[$d]['sleep']['total'] += (int)$r['m'];
         }
         ksort($days);
+
+        // Note personali scritte dall'utente sui singoli giorni (contesto qualitativo).
+        ensure_day_notes($pdo);
+        $noteSt = $pdo->prepare("SELECT note_date, note FROM day_notes WHERE note_date >= ? ORDER BY note_date");
+        $noteSt->execute([$startDate]);
+        $userNotes = [];
+        foreach ($noteSt as $r) {
+            $n = trim(preg_replace('/\s+/u', ' ', (string)$r['note']));   // su una riga sola nel prompt
+            if ($n !== '') $userNotes[$r['note_date']] = $n;
+        }
 
         // Helper per le statistiche annuali e per le celle del CSV.
         $col = function (string $grp, string $key) use ($days) {
@@ -238,10 +309,11 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $P .= "== ISTRUZIONI ==\n";
         $P .= "1. Riassumi lo stato di salute generale che emerge dai dati.\n";
         $P .= "2. Individua le tendenze nel tempo (miglioramenti o peggioramenti) per ciascuna metrica.\n";
-        $P .= "3. Segnala valori anomali o potenziali campanelli d'allarme (es. SpO2 bassa, battito a riposo elevato, HRV in calo, sonno insufficiente, pressione alta).\n";
+        $P .= "3. Segnala valori anomali o potenziali campanelli d'allarme (es. SpO2 bassa, battito a riposo elevato, HRV in calo, sonno insufficiente, pressione alta), distinguendo le anomalie PERSISTENTI dai singoli valori isolati che possono essere artefatti del sensore (vedi NOTA SULLA QUALITÀ DEI DATI).\n";
         $P .= "4. Evidenzia possibili correlazioni tra le metriche (es. stress alto ↔ HRV basso ↔ sonno scarso).\n";
         $P .= "5. Fornisci consigli pratici e personalizzati per migliorare i parametri.\n";
         $P .= "6. Indica chiaramente quando sarebbe opportuno consultare un medico.\n";
+        $P .= "7. Tieni conto delle NOTE PERSONALI scritte dall'utente (sezione dedicata più sotto): usale per interpretare i valori osservati (es. attività fisica, viaggi, alimentazione, stress, malesseri) e per rendere analisi e consigli più pertinenti alla sua vita reale. Distingui ciò che è spiegato da una nota (atteso) da ciò che resta inspiegato (da approfondire).\n";
         $P .= "Rispondi in italiano, in modo chiaro e comprensibile anche a un non esperto.\n";
         $P .= "IMPORTANTE: questa è un'analisi informativa e NON sostituisce il parere di un medico.\n\n";
         $P .= "== FORMATO DELLA RISPOSTA ==\n";
@@ -262,6 +334,11 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
         $P .= "- Passi / Calorie (kcal) / Distanza (m): attività fisica giornaliera.\n";
         $P .= "- Sonno: minuti totali e suddivisione in fasi (leggero, profondo, REM, sveglio).\n";
         $P .= "- Pressione (PA): sistolica/diastolica (mmHg). Riferimento ~120/80.\n\n";
+        $P .= "== NOTA SULLA QUALITÀ DEI DATI ==\n";
+        $P .= "I dati provengono da un sensore ottico da polso (H59) che può occasionalmente produrre letture errate ISOLATE (cali o picchi momentanei non fisiologici). Per limitarne l'effetto, i valori min/max giornalieri qui riportati NON sono il minimo/massimo assoluto del giorno ma il 5°/95° percentile: quindi hr_min ≈ battito a riposo e hr_max ≈ picco sotto sforzo, già ripuliti dai singoli glitch.\n";
+        $P .= "Di conseguenza:\n";
+        $P .= "- Considera attendibili soprattutto le anomalie PERSISTENTI o RICORRENTI (su più ore o più giorni), non i singoli valori fuori scala.\n";
+        $P .= "- Se un valore appare clinicamente implausibile e non è confermato dal contesto (giorni vicini, altre metriche correlate), trattalo come probabile artefatto del sensore e segnalalo come tale, senza darlo per certo né costruirci sopra un allarme.\n\n";
         $P .= "== RIEPILOGO PERIODO ==\n";
         $P .= "Intervallo: dal $first al $last — " . count($days) . " giorni con dati.\n";
         $P .= "Battito: media {$avg($col('hr','a'))} bpm (min giornaliero {$mn($col('hr','mn'))}, picco {$mx($col('hr','mx'))}).\n";
@@ -313,6 +390,15 @@ if (($_GET['action'] ?? '') === 'ai_prompt') {
             ]) . "\n";
         }
         if (!$older) $P .= "(nessun dato nei mesi precedenti)\n";
+
+        $P .= "\n== NOTE PERSONALI DELL'UTENTE (contesto qualitativo) ==\n";
+        $P .= "Annotazioni scritte dall'utente per spiegare cosa è successo in certi giorni o fasce orarie (attività fisica, eventi, viaggi, alimentazione, malesseri...). NON sono dati clinici ma contesto reale: usale per interpretare i numeri e personalizzare consigli e segnalazioni (es. molti passi e battito alto in un giorno con nota \"corsa\" sono attesi; un sonno scarso con nota \"viaggio\" non è un campanello d'allarme). Formato: una riga per giorno, \"data: nota\".\n";
+        if ($userNotes) {
+            foreach ($userNotes as $d => $n) $P .= "$d: $n\n";
+        } else {
+            $P .= "(nessuna nota inserita dall'utente)\n";
+        }
+
         $P .= "== FINE DATI ==\n\nProcedi ora con l'analisi sanitaria seguendo le istruzioni qui sopra.\n";
 
         @file_put_contents(__DIR__ . '/prompt.txt', $P);   // copia di debug del prompt inviato
@@ -404,12 +490,17 @@ function tlocal($ts) {
 
 /* ---------- Lettura dati per la dashboard ---------- */
 $err = null;
-$latest = []; $hr = []; $steps = []; $recent = []; $stressHist = []; $hrv = []; $allrows = [];
+$latest = []; $hr = []; $steps = []; $stepsByDay = []; $recent = []; $stressHist = []; $hrv = []; $allrows = [];
 $spo2hist = []; $sleepSegs = []; $sleepDate = null; $sleepStart = null; $sleepDays = [];
 $latestStress = false; $latestHrv = false; $latestSpo2 = false;
 $series = ['spo2' => [], 'blood_pressure' => []];
+$daysWithData = []; $dayNotes = [];   // diario: giorni con dati + note personali
 try {
     $pdo = db();
+    // Giorno locale (Europe/Rome) per i raggruppamenti, con fallback a UTC se le
+    // tabelle del fuso orario non sono caricate in MySQL.
+    $tzOk = $pdo->query("SELECT CONVERT_TZ('2024-06-01 12:00:00','+00:00','Europe/Rome')")->fetchColumn() !== null;
+    $LD = $tzOk ? "DATE(CONVERT_TZ(ts,'+00:00','Europe/Rome'))" : "DATE(ts)";
     $q = $pdo->query("SELECT m.metric, m.value, m.value2, m.unit, m.ts
                       FROM measurements m
                       JOIN (SELECT metric, MAX(id) id FROM measurements GROUP BY metric) x
@@ -418,6 +509,9 @@ try {
 
     foreach ($pdo->query("SELECT ts, bpm FROM hr_samples WHERE $cond ORDER BY ts") as $r) $hr[] = $r;
     foreach ($pdo->query("SELECT ts, steps FROM step_samples WHERE $cond ORDER BY ts") as $r) $steps[] = $r;
+    // Passi sommati per giorno locale: usato dal grafico quando il periodo copre più giorni.
+    foreach ($pdo->query("SELECT $LD d, SUM(steps) s FROM step_samples WHERE $cond GROUP BY d ORDER BY d") as $r)
+        $stepsByDay[] = ['d' => $r['d'], 's' => (int)$r['s']];
     foreach ($pdo->query("SELECT ts, score FROM stress_samples WHERE $cond ORDER BY ts") as $r) $stressHist[] = $r;
     foreach ($pdo->query("SELECT ts, ms FROM hrv_samples WHERE $cond ORDER BY ts") as $r) $hrv[] = $r;
     foreach ($pdo->query("SELECT ts, spo2 FROM spo2_samples WHERE $cond ORDER BY ts") as $r) $spo2hist[] = $r;
@@ -466,6 +560,24 @@ try {
          UNION ALL SELECT ts, 'HRV', ms, NULL, NULL, 'ms' FROM hrv_samples WHERE $cond
          UNION ALL SELECT ts, metric, value, value2, NULL, unit FROM measurements WHERE $cond
          ORDER BY ts DESC LIMIT 1000")->fetchAll();
+
+    // ----- Diario: giorni con almeno un dato (ultimi 6 mesi) + note personali -----
+    // Indipendente dal periodo selezionato sopra: il diario alimenta l'analisi AI (6 mesi).
+    // Raggruppa per giorno locale ($LD, definito sopra) come fa il prompt AI.
+    $noteStartUtc  = (new DateTime('now', $UTC))->modify('-6 month')->format('Y-m-d H:i:s');
+    $noteStartDate = (new DateTime('now', $TZL))->modify('-6 month')->format('Y-m-d');
+    foreach ([['hr_samples','Battito'], ['step_samples','Passi'], ['stress_samples','Stress'],
+              ['hrv_samples','HRV'], ['spo2_samples','SpO2'], ['measurements','Misure']] as [$tbl, $lbl]) {
+        $st = $pdo->prepare("SELECT DISTINCT $LD d FROM $tbl WHERE ts >= ?");
+        $st->execute([$noteStartUtc]);
+        foreach ($st as $r) { $daysWithData[$r['d']][] = $lbl; }
+    }
+    $st = $pdo->prepare("SELECT DISTINCT sleep_date d FROM sleep_segments WHERE sleep_date >= ?");
+    $st->execute([$noteStartDate]);
+    foreach ($st as $r) { $daysWithData[$r['d']][] = 'Sonno'; }
+    krsort($daysWithData);   // giorni più recenti in cima
+    ensure_day_notes($pdo);
+    foreach ($pdo->query("SELECT note_date, note FROM day_notes") as $r) { $dayNotes[$r['note_date']] = $r['note']; }
 } catch (Throwable $e) {
     $err = $e->getMessage();
 }
@@ -622,6 +734,19 @@ function row_value($r) {
   .sleepday.bad { background:#2a1a1d; border-radius:10px; padding:14px; margin:6px 0; border-top:0; }
   .flag { display:inline-block; margin-left:10px; font-size:12px; font-weight:600; color:#ffb4bd;
           background:#3a1f24; padding:2px 8px; border-radius:999px; }
+  .notescroll { max-height:560px; overflow:auto; margin-top:6px; padding-right:6px; }
+  .noteday { padding:13px 0; border-top:1px solid #232c36; }
+  .noteday:first-child { border-top:0; }
+  .noteday-head { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:7px; }
+  .noteday-date { font-weight:600; font-size:15px; }
+  .noteday-meta { color:var(--mut); font-size:12.5px; }
+  .note-dot { color:var(--acc); font-size:13px; }
+  .noteday textarea { width:100%; background:#0f1419; color:var(--txt); border:1px solid #2a3540;
+          border-radius:8px; padding:9px 10px; font:inherit; font-size:14px; line-height:1.45;
+          resize:vertical; min-height:44px; }
+  .notebar { display:flex; align-items:center; gap:12px; margin-top:8px; }
+  button.mini { padding:8px 14px; font-size:13px; }
+  .notesaved { color:var(--acc); font-size:13px; }
 </style>
 </head>
 <body>
@@ -693,14 +818,49 @@ function row_value($r) {
   <div id="aidiet" class="report" style="display:none"><?= $lrDiet ?></div>
 </div>
 
+<div class="panel">
+  <h2>Diario · note giornaliere <span class="sleeprange"><?= count($daysWithData) ?> giorni con dati</span></h2>
+  <p class="hint">Aggiungi una nota ai giorni con dati raccolti per dare contesto all'<strong>Analisi AI</strong> qui sopra: cosa hai fatto, attività, eventi, come ti sentivi (es. &ldquo;pomeriggio corsa 10&nbsp;km&rdquo;, &ldquo;16-18 palestra&rdquo;, &ldquo;ferie al mare&rdquo;). Le note degli ultimi 6 mesi vengono incluse nel prompt inviato al modello. Dal giorno più recente.</p>
+  <?php if ($daysWithData): ?>
+  <div class="notescroll">
+    <?php foreach ($daysWithData as $d => $labels): $note = $dayNotes[$d] ?? ''; ?>
+      <div class="noteday" data-date="<?= htmlspecialchars($d) ?>" data-saved="<?= htmlspecialchars($note) ?>">
+        <div class="noteday-head">
+          <span class="noteday-date"><?= htmlspecialchars(date('d/m/Y', strtotime($d))) ?></span>
+          <span class="note-dot"<?= $note !== '' ? '' : ' style="display:none"' ?>>● nota</span>
+          <span class="noteday-meta"><?= htmlspecialchars(implode(' · ', array_unique($labels))) ?></span>
+        </div>
+        <textarea rows="2" placeholder="Aggiungi una nota per questo giorno…" oninput="noteChanged(this)"><?= htmlspecialchars($note) ?></textarea>
+        <div class="notebar">
+          <button type="button" class="mini savebtn" onclick="saveNote('<?= htmlspecialchars($d) ?>')" disabled>Salva nota</button>
+          <span class="notesaved"></span>
+        </div>
+      </div>
+    <?php endforeach; ?>
+  </div>
+  <?php else: ?>
+    <div class="hint">Nessun giorno con dati ancora. Sincronizza col braccialetto, poi torna qui per annotare le tue giornate.</div>
+  <?php endif; ?>
+</div>
+
 <?php $pl = $RANGES[$range]; ?>
+<div class="panel">
+  <h2>Visualizzazione grafici</h2>
+  <div class="btns" id="dataModeToggle">
+    <a class="rbtn on" href="#" data-mode="real" onclick="setStatMode(false);return false;">Dati reali</a>
+    <a class="rbtn" href="#" data-mode="stat" onclick="setStatMode(true);return false;">Dati statistici</a>
+  </div>
+  <div class="hint"><strong>Dati reali</strong>: campioni grezzi del sensore (mostra anche eventuali artefatti). <strong>Dati statistici</strong>: filtro di mediana mobile che rimuove i picchi/cali isolati del sensore. Vale per battito, SpO2, stress e HRV.</div>
+</div>
+
 <div class="panel">
   <h2>Battito · <?= htmlspecialchars($pl) ?></h2>
   <canvas id="hrChart" height="110"></canvas>
 </div>
 
+<?php $stepsDaily = count($stepsByDay) > 1; ?>
 <div class="panel">
-  <h2>Passi · <?= htmlspecialchars($pl) ?></h2>
+  <h2>Passi · <?= htmlspecialchars($pl) ?><?= $stepsDaily ? ' <span class="sleeprange">totale per giorno</span>' : '' ?></h2>
   <canvas id="stepChart" height="110"></canvas>
 </div>
 
@@ -794,6 +954,8 @@ const hrLabels    = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $hr)
 const hrVals      = <?= json_encode(array_map(fn($r)=>(int)$r['bpm'], $hr)) ?>;
 const stepLabels  = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $steps)) ?>;
 const stepVals    = <?= json_encode(array_map(fn($r)=>(int)$r['steps'], $steps)) ?>;
+const stepDayLabels = <?= json_encode(array_map(fn($r)=>date('d/m', strtotime($r['d'])), $stepsByDay)) ?>;
+const stepDayVals   = <?= json_encode(array_map(fn($r)=>(int)$r['s'], $stepsByDay)) ?>;
 const bpLabels    = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $series['blood_pressure'])) ?>;
 const bpSys       = <?= json_encode(array_map(fn($r)=>(int)$r['value'], $series['blood_pressure'])) ?>;
 const bpDia       = <?= json_encode(array_map(fn($r)=>(int)$r['value2'], $series['blood_pressure'])) ?>;
@@ -803,6 +965,23 @@ const stressLabels= <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $str
 const stressVals  = <?= json_encode(array_map(fn($r)=>(int)$r['score'], $stressHist)) ?>;
 const hrvLabels   = <?= json_encode(array_map(fn($r)=>tlabel($r['ts'],$LR), $hrv)) ?>;
 const hrvVals     = <?= json_encode(array_map(fn($r)=>(int)$r['ms'], $hrv)) ?>;
+
+// ---- Vista "Dati statistici": filtro di mediana mobile (finestra ±2 campioni)
+// che sostituisce i singoli picchi/cali isolati del sensore con la mediana locale,
+// lasciando intatta la forma della serie. Usato dal toggle "Dati reali / statistici".
+function _median(a){ if(!a.length) return NaN; const s=a.slice().sort((x,y)=>x-y), n=s.length;
+  return n%2 ? s[(n-1)/2] : (s[n/2-1]+s[n/2])/2; }
+function rollingMedian(vals, w=2){
+  if(vals.length < 2*w+1) return vals.slice();
+  return vals.map((_,i)=>{
+    const lo=Math.max(0,i-w), hi=Math.min(vals.length-1,i+w);
+    return Math.round(_median(vals.slice(lo,hi+1)));
+  });
+}
+const hrValsStat     = rollingMedian(hrVals);
+const spo2ValsStat   = rollingMedian(spo2Vals);
+const stressValsStat = rollingMedian(stressVals);
+const hrvValsStat    = rollingMedian(hrvVals);
 
 const baseOpts = { responsive:true, plugins:{legend:{display:false}},
   scales:{ x:{ ticks:{color:'#8b98a5', maxTicksLimit:12}, grid:{color:'#232c36'} },
@@ -816,16 +995,33 @@ function noData(id){
 }
 
 function lineChart(id, labels, datasets, zero=false){
-  if(!labels.length){ noData(id); return; }
-  new Chart(document.getElementById(id), { type:'line', data:{labels, datasets},
+  if(!labels.length){ noData(id); return null; }
+  return new Chart(document.getElementById(id), { type:'line', data:{labels, datasets},
     options:{ ...baseOpts, plugins:{legend:{display:datasets.length>1, labels:{color:'#e6edf3'}}},
       scales:{ ...baseOpts.scales, y:{ ...baseOpts.scales.y, beginAtZero:zero } } } });
 }
 
-lineChart('hrChart', hrLabels, [{ label:'bpm', data:hrVals, borderColor:'#46d39a',
-    backgroundColor:'rgba(70,211,154,.15)', fill:true, tension:.3, pointRadius:2, borderWidth:2 }]);
+// Grafici a campioni continui registrati per il toggle "Dati reali / statistici".
+const _statCharts = [];
+function registerStat(chart, raw, stat){ if(chart) _statCharts.push({chart, raw, stat}); }
+function setStatMode(on){
+  document.querySelectorAll('#dataModeToggle .rbtn').forEach(b =>
+    b.classList.toggle('on', (b.dataset.mode==='stat')===on));
+  _statCharts.forEach(({chart, raw, stat})=>{ chart.data.datasets[0].data = on?stat:raw; chart.update(); });
+  try{ localStorage.setItem('ludohealt_datamode', on?'stat':'real'); }catch(e){}
+}
 
-if(stepLabels.length){
+const hrChart = lineChart('hrChart', hrLabels, [{ label:'bpm', data:hrVals, borderColor:'#46d39a',
+    backgroundColor:'rgba(70,211,154,.15)', fill:true, tension:.3, pointRadius:2, borderWidth:2 }]);
+registerStat(hrChart, hrVals, hrValsStat);
+
+// Periodo su più giorni: una barra per giorno col totale passi giornaliero.
+// Altrimenti i singoli slot del sensore (vista intra-giornaliera) come prima.
+if(stepDayVals.length > 1){
+  new Chart(document.getElementById('stepChart'), { type:'bar',
+    data:{ labels:stepDayLabels, datasets:[{ label:'passi/giorno', data:stepDayVals, backgroundColor:'#46d39a' }]},
+    options:{ ...baseOpts, scales:{ ...baseOpts.scales, y:{ ...baseOpts.scales.y, beginAtZero:true } } } });
+} else if(stepLabels.length){
   new Chart(document.getElementById('stepChart'), { type:'bar',
     data:{ labels:stepLabels, datasets:[{ label:'passi', data:stepVals, backgroundColor:'#46d39a' }]},
     options:{ ...baseOpts, scales:{ ...baseOpts.scales, y:{ ...baseOpts.scales.y, beginAtZero:true } } } });
@@ -835,12 +1031,18 @@ lineChart('bpChart', bpLabels, [
   { label:'sistolica', data:bpSys, borderColor:'#ff6b6b', backgroundColor:'rgba(255,107,107,.12)', fill:false, tension:.3, pointRadius:3, borderWidth:2 },
   { label:'diastolica', data:bpDia, borderColor:'#5a9bff', backgroundColor:'rgba(90,155,255,.12)', fill:false, tension:.3, pointRadius:3, borderWidth:2 }
 ]);
-lineChart('spo2Chart', spo2Labels, [{ label:'SpO2 %', data:spo2Vals, borderColor:'#46d39a',
+const spo2Chart = lineChart('spo2Chart', spo2Labels, [{ label:'SpO2 %', data:spo2Vals, borderColor:'#46d39a',
     backgroundColor:'rgba(70,211,154,.15)', fill:true, tension:.3, pointRadius:3, borderWidth:2 }]);
-lineChart('stressChart', stressLabels, [{ label:'stress', data:stressVals, borderColor:'#f5b73b',
+registerStat(spo2Chart, spo2Vals, spo2ValsStat);
+const stressChart = lineChart('stressChart', stressLabels, [{ label:'stress', data:stressVals, borderColor:'#f5b73b',
     backgroundColor:'rgba(245,183,59,.15)', fill:true, tension:.3, pointRadius:2, borderWidth:2 }]);
-lineChart('hrvChart', hrvLabels, [{ label:'HRV ms', data:hrvVals, borderColor:'#b07bff',
+registerStat(stressChart, stressVals, stressValsStat);
+const hrvChart = lineChart('hrvChart', hrvLabels, [{ label:'HRV ms', data:hrvVals, borderColor:'#b07bff',
     backgroundColor:'rgba(176,123,255,.15)', fill:true, tension:.3, pointRadius:2, borderWidth:2 }]);
+registerStat(hrvChart, hrvVals, hrvValsStat);
+
+// Applica la modalità salvata (default: dati reali).
+try{ if(localStorage.getItem('ludohealt_datamode')==='stat') setStatMode(true); }catch(e){}
 
 async function sync(mode){
   const btns = document.querySelectorAll('button'); btns.forEach(b=>b.disabled=true);
@@ -899,6 +1101,37 @@ function toggleBox(boxId, btn){
   const hidden = (f.style.display === 'none');
   f.style.display = hidden ? '' : 'none';
   btn.textContent = (hidden ? 'Nascondi ' : 'Vedi ') + btn.dataset.label;
+}
+
+// Diario: abilita "Salva" solo quando la nota è cambiata rispetto a quella salvata.
+function noteChanged(ta){
+  const box = ta.closest('.noteday');
+  box.querySelector('.savebtn').disabled = (ta.value === box.dataset.saved);
+  box.querySelector('.notesaved').textContent = '';
+}
+async function saveNote(date){
+  const box = document.querySelector('.noteday[data-date="'+date+'"]');
+  if(!box) return;
+  const ta = box.querySelector('textarea');
+  const btn = box.querySelector('.savebtn');
+  const stat = box.querySelector('.notesaved');
+  btn.disabled = true; stat.textContent = 'Salvataggio…';
+  try{
+    const r = await fetch('?action=save_note', {method:'POST',
+      body: new URLSearchParams({date: date, note: ta.value})});
+    const j = await r.json();
+    if(j.ok){
+      box.dataset.saved = j.note;
+      ta.value = j.note;                       // riflette il cap server-side (2000 caratteri)
+      box.querySelector('.note-dot').style.display = j.has ? '' : 'none';
+      stat.textContent = '✓ Salvato';
+      btn.disabled = true;
+      setTimeout(()=>{ if(stat.textContent==='✓ Salvato') stat.textContent=''; }, 2500);
+    } else {
+      stat.textContent = '✗ '+((j.errors||['errore']).join(' '));
+      btn.disabled = false;
+    }
+  }catch(e){ stat.textContent = '✗ Errore di rete'; btn.disabled = false; }
 }
 </script>
 </body>
